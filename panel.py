@@ -915,9 +915,9 @@ button:active{transform:scale(.98)}
 # ==================== 页脚版权 ====================
 
 FOOTER_HTML = (
-    '<div class="foot">© '
+    '<div class="foot">Copyright © 2026 '
     '<a href="https://www.godr.cn/" target="_blank" rel="noopener">亦桉</a>'
-    ' · 保留所有权利'
+    ' · www.godr.cn All rights reserved.'
     '<div class="foot2">未经许可禁止商业用途，二次开发须保留本版权信息'
     ' · <a href="/license">查看许可</a></div>'
     '</div>'
