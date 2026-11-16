@@ -1,5 +1,5 @@
 # 🖨️ p910nd-panel
-
+![](https://imgdrive.r2.010102.xyz/content_images/2026/11/16/6afb06c418303.png)
 把一台 USB 打印机变成网络打印机的单容器服务：内置 **9100 RAW / JetDirect** 打印服务，同时提供 **8910** Web 管理面板。
 
 适用于内核裁剪、没有 `usblp`/`usbprinter` 模块、也没有 `/dev/usb/lp*` 节点的系统（例如飞牛 fnOS）。这类环境里 p910nd 完全跑不起来，本项目改用 **pyusb 直接操作 USB 打印接口（class 7）**，绕开内核打印驱动。
@@ -118,5 +118,3 @@ API：`/api/status` `/api/log` `/api/jobs` `/api/jobs/clear` `/api/stats?days=7|
 - ❌ **不得冒名**：不得以原作者名义宣传，或暗示原作者为衍生作品背书。
 
 Copyright ©️ 2026 亦桉 · [](https://www.godr.cn/) www.godr.cn All rights reserved.
-
-如果你需要，我可以再单独输出一份 `docker-compose.pull.yml` 的完整文本。
