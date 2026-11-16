@@ -2,35 +2,33 @@ name: build-acr
 
 # 推送到阿里云容器镜像服务（ACR）。国内拉取比 GHCR 快很多。
 #
-# 需要先在仓库 Settings > Secrets and variables > Actions 里配置：
+# 需要预先配置（Variables 或 Secrets 都行，脚本先读 Variables）：
 #   ACR_REGISTRY    仓库地址，例如 registry.cn-hangzhou.aliyuncs.com
 #   ACR_NAMESPACE   命名空间，例如 godr
 #   ACR_USERNAME    阿里云账号（或容器镜像服务的固定用户名）
 #   ACR_PASSWORD    容器镜像服务「访问凭证」里设置的固定密码
 #
-# 前两个填在 Variables 或 Secrets 里都行，脚本会先读 Variables 再读 Secrets，
-# 所以不用改这个文件就能换仓库/命名空间。
+# 【架构策略】
+# ACR 个人版不支持多架构清单（manifest list），所以这里不用一次推多个架构，
+# 而是按架构分别构建、分别推送单一架构镜像，用标签区分：
 #
-# 拼出来的镜像地址 = <ACR_REGISTRY>/<ACR_NAMESPACE>/p910nd-panel
+#   <仓库>/<命名空间>/p910nd-panel:amd64      x86_64（绝大多数 NAS、电脑）
+#   <仓库>/<命名空间>/p910nd-panel:arm64      ARM 64 位（树莓派 4/5、ARM 群晖）
+#   <仓库>/<命名空间>/p910nd-panel:arm-v7     ARM 32 位（树莓派 2/3、老 ARM 盒子）
+#   <仓库>/<命名空间>/p910nd-panel:386        x86 32 位（老 PC、部分工控机）
 #
-# 【为什么只构建一个架构】
-# 阿里云 ACR 个人版（免费版）不支持多架构镜像（manifest list），
-# 一次推 amd64+arm64 会在 Build and push 步骤被拒绝。
-# 所以这里保持单架构，运行时可手动选 amd64 或 arm64。
-# 绝大多数 x86 机器（含飞牛 NAS）选 linux/amd64 即可；
-# 树莓派、部分 ARM 群晖/极空间选 linux/arm64。
+# amd64 那一次会额外推一个 :latest，其他架构只推自己的标签。
+# 部署时按设备架构选标签即可，例如 32 位 ARM：
+#   PANEL_IMAGE=registry.cn-hangzhou.aliyuncs.com/godr/p910nd-panel:arm-v7
 
 on:
   workflow_dispatch:
     inputs:
-      platform:
-        description: "目标架构（x86 机器选 amd64，ARM 机器选 arm64）"
+      platforms:
+        description: "要构建的架构，英文逗号分隔"
         required: true
-        default: "linux/amd64"
-        type: choice
-        options:
-          - linux/amd64
-          - linux/arm64
+        default: "linux/amd64,linux/arm64,linux/arm/v7,linux/386"
+        type: string
 
 env:
   ACR_REGISTRY: ${{ vars.ACR_REGISTRY || secrets.ACR_REGISTRY }}
@@ -38,22 +36,67 @@ env:
   IMAGE: ${{ vars.ACR_REGISTRY || secrets.ACR_REGISTRY }}/${{ vars.ACR_NAMESPACE || secrets.ACR_NAMESPACE }}/p910nd-panel
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Show target
+      - name: Check target
         run: |
           echo "仓库地址：${{ env.ACR_REGISTRY }}"
           echo "命名空间：${{ env.ACR_NAMESPACE }}"
           echo "完整镜像：${{ env.IMAGE }}"
-          echo "目标架构：${{ inputs.platform }}"
           if [ -z "${{ env.ACR_REGISTRY }}" ] || [ -z "${{ env.ACR_NAMESPACE }}" ]; then
             echo "::error::ACR_REGISTRY 或 ACR_NAMESPACE 未配置，请在 Settings > Secrets and variables > Actions 里补上"
             exit 1
           fi
+
+      - name: Build matrix
+        id: split
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          items = [p.strip() for p in os.environ["PLATFORMS"].split(",") if p.strip()]
+          if not items:
+              raise SystemExit("platforms 不能为空")
+          print("要构建的架构：", ", ".join(items))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"platform": items}) + "\n")
+          PY
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    name: build-${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Platform tag
+        id: tag
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          IMAGE: ${{ env.IMAGE }}
+          RUN: ${{ github.run_number }}
+        run: |
+          SUFFIX=$(echo "$PLATFORM" | sed 's|linux/||; s|/|-|g')
+          echo "suffix=$SUFFIX" >> "$GITHUB_OUTPUT"
+          # 每个架构推两个标签；amd64 额外多推一个 latest，方便默认部署
+          {
+            echo "tags<<EOF"
+            echo "$IMAGE:$SUFFIX"
+            echo "$IMAGE:$SUFFIX-$RUN"
+            if [ "$PLATFORM" = "linux/amd64" ]; then
+              echo "$IMAGE:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "本次构建：$PLATFORM  ->  标签后缀 :$SUFFIX"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -72,15 +115,19 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: ${{ inputs.platform }}
+          platforms: ${{ matrix.platform }}
           push: true
-          # 阿里云 ACR 个人版会拒收 buildx 默认附带的多架构/attestation 清单，
+          # ACR 个人版会拒收 buildx 默认附带的多架构/attestation 清单，
           # 报错形如：denied: unknown manifest class for application/vnd.oci.empty.v1+json
-          # 关掉这两个证明清单，只推单一普通镜像，就没问题了。
           provenance: false
           sbom: false
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.run_number }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.tag.outputs.tags }}
+          cache-from: type=gha,scope=${{ steps.tag.outputs.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ steps.tag.outputs.suffix }}
+
+      - name: Summary
+        run: |
+          echo "### 已推送 ${{ matrix.platform }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.tag.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

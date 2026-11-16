@@ -47,8 +47,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # GHCR 支持多架构清单，一次构建四个架构，拉取时按设备自动匹配
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/386
           push: true
+          provenance: false
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
