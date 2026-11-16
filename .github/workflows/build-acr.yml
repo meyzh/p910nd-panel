@@ -74,6 +74,11 @@ jobs:
           context: .
           platforms: ${{ inputs.platform }}
           push: true
+          # 阿里云 ACR 个人版会拒收 buildx 默认附带的多架构/attestation 清单，
+          # 报错形如：denied: unknown manifest class for application/vnd.oci.empty.v1+json
+          # 关掉这两个证明清单，只推单一普通镜像，就没问题了。
+          provenance: false
+          sbom: false
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.run_number }}
