@@ -121,7 +121,8 @@ def uptime_str():
     hours, rest = divmod(rest, 3600)
     mins, secs = divmod(rest, 60)
     if days:
-        return "%d天%d小时%d分" % (days, hours, mins)
+        # 超过一天也要带秒，否则页面上看着像不刷新
+        return "%d天%d小时%d分%d秒" % (days, hours, mins, secs)
     if hours:
         return "%d小时%d分%d秒" % (hours, mins, secs)
     return "%d分%d秒" % (mins, secs)
@@ -1211,6 +1212,23 @@ function fmtBytes(n){
 function setText(id,txt){var e=document.getElementById(id);if(e)e.innerText=txt;}
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"})[c];});}
 
+/* ---- 运行时长：页面本地每秒自增，不依赖服务端轮询 ---- */
+var upBase = null, upAt = 0, upTimer = null;
+function fmtUptime(s){
+  s = Math.max(0, Math.floor(s));
+  var d = Math.floor(s/86400); s -= d*86400;
+  var h = Math.floor(s/3600);  s -= h*3600;
+  var m = Math.floor(s/60);    var c = s - m*60;
+  if(d) return d+"天"+h+"小时"+m+"分"+c+"秒";
+  if(h) return h+"小时"+m+"分"+c+"秒";
+  return m+"分"+c+"秒";
+}
+function tickUptime(){
+  if(upBase===null) return;
+  setText("i_uptime", fmtUptime(upBase + (Date.now()-upAt)/1000));
+}
+function startUptimeTimer(){ if(!upTimer) upTimer = setInterval(tickUptime,1000); }
+
 var lastStatsAt = 0;
 
 function loadStats(force){
@@ -1259,7 +1277,13 @@ function refresh(){
     setText("i_name", d.printer_name || "--");
     setText("i_bus", d.usb_online ? (d.usb_bus + " / " + d.usb_addr) : "--");
     setText("i_speed", d.usb_speed || "--");
-    setText("i_uptime", d.uptime);
+    if(d.uptime_sec!=null){
+      // 只在初始或明显跑偏时才校准，避免每 3 秒被服务端整数秒拉回去造成跳动
+      var est = (upBase===null) ? null : upBase + (Date.now()-upAt)/1000;
+      if(est===null || Math.abs(est - d.uptime_sec) > 2){ upBase = d.uptime_sec; upAt = Date.now(); }
+      tickUptime();
+    }
+    else setText("i_uptime", d.uptime);
     setText("i_clients", d.active_clients);
     setText("i_reconnects", d.reconnects);
     setText("i_lasttime", d.last_job_time || "--");
@@ -1324,6 +1348,7 @@ function stopTimer(){if(timer){clearInterval(timer);timer=null;}}
 refresh();
 loadStats(true);
 startTimer();
+startUptimeTimer();
 </script>
 %FOOTER%
 </body>
@@ -1894,6 +1919,7 @@ def api_status():
         source_count = len(set([j.get("ip") for j in jobs if j.get("ip")]))
     data["source_count"] = source_count
     data["uptime"] = uptime_str()
+    data["uptime_sec"] = round(time.time() - START_TS, 1)
     data["pyusb_ok"] = PYUSB_OK
     data["pyusb_error"] = PYUSB_ERROR
     data["printer_id"] = PRINTER_ID
