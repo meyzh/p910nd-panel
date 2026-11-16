@@ -1,18 +1,41 @@
 name: build-acr
 
-# 可选：推送到阿里云容器镜像服务（ACR）。国内拉取比 GHCR 快很多。
-# 使用前在仓库 Settings > Secrets and variables > Actions 里添加：
-#   ACR_REGISTRY   例如 registry.cn-hangzhou.aliyuncs.com
-#   ACR_NAMESPACE  你的命名空间，例如 meyzh
-#   ACR_USERNAME   阿里云账号（或固定 AccessKey 用户名）
-#   ACR_PASSWORD   阿里云容器镜像服务的固定密码
-# 然后在 Actions 页面手动点 Run workflow 触发。
+# 推送到阿里云容器镜像服务（ACR）。国内拉取比 GHCR 快很多。
+#
+# 需要先在仓库 Settings > Secrets and variables > Actions 里配置：
+#   ACR_REGISTRY    仓库地址，例如 registry.cn-hangzhou.aliyuncs.com
+#   ACR_NAMESPACE   命名空间，例如 godr
+#   ACR_USERNAME    阿里云账号（或容器镜像服务的固定用户名）
+#   ACR_PASSWORD    容器镜像服务「访问凭证」里设置的固定密码
+#
+# 前两个填在 Variables 或 Secrets 里都行，脚本会先读 Variables 再读 Secrets，
+# 所以不用改这个文件就能换仓库/命名空间。
+#
+# 拼出来的镜像地址 = <ACR_REGISTRY>/<ACR_NAMESPACE>/p910nd-panel
+#
+# 【为什么只构建一个架构】
+# 阿里云 ACR 个人版（免费版）不支持多架构镜像（manifest list），
+# 一次推 amd64+arm64 会在 Build and push 步骤被拒绝。
+# 所以这里保持单架构，运行时可手动选 amd64 或 arm64。
+# 绝大多数 x86 机器（含飞牛 NAS）选 linux/amd64 即可；
+# 树莓派、部分 ARM 群晖/极空间选 linux/arm64。
 
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: "目标架构（x86 机器选 amd64，ARM 机器选 arm64）"
+        required: true
+        default: "linux/amd64"
+        type: choice
+        options:
+          - linux/amd64
+          - linux/arm64
 
 env:
-  IMAGE: ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/p910nd-panel
+  ACR_REGISTRY: ${{ vars.ACR_REGISTRY || secrets.ACR_REGISTRY }}
+  ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE || secrets.ACR_NAMESPACE }}
+  IMAGE: ${{ vars.ACR_REGISTRY || secrets.ACR_REGISTRY }}/${{ vars.ACR_NAMESPACE || secrets.ACR_NAMESPACE }}/p910nd-panel
 
 jobs:
   build:
@@ -20,6 +43,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Show target
+        run: |
+          echo "仓库地址：${{ env.ACR_REGISTRY }}"
+          echo "命名空间：${{ env.ACR_NAMESPACE }}"
+          echo "完整镜像：${{ env.IMAGE }}"
+          echo "目标架构：${{ inputs.platform }}"
+          if [ -z "${{ env.ACR_REGISTRY }}" ] || [ -z "${{ env.ACR_NAMESPACE }}" ]; then
+            echo "::error::ACR_REGISTRY 或 ACR_NAMESPACE 未配置，请在 Settings > Secrets and variables > Actions 里补上"
+            exit 1
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -30,7 +64,7 @@ jobs:
       - name: Login ACR
         uses: docker/login-action@v3
         with:
-          registry: ${{ secrets.ACR_REGISTRY }}
+          registry: ${{ env.ACR_REGISTRY }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
@@ -38,7 +72,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ inputs.platform }}
           push: true
           tags: |
             ${{ env.IMAGE }}:latest
