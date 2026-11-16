@@ -1,0 +1,36 @@
+services:
+  p910nd-panel:
+    build: .
+    image: p910nd-panel:latest
+    container_name: p910nd-panel
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "9100:9100"
+      - "8910:8910"
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    volumes:
+      # 配置、账号、推送设置、打印任务记录都持久化在这里
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+      # 注意：这里不再配置账号密码。
+      # 第一次打开 http://NAS的IP:8910 时，页面会让你自己设置一个访问密码（只有密码，没有用户名），
+      # 密码只以哈希形式存在 ./data/config.json 里，不会出现在环境变量或日志中。
+      # ---- 首次启动的默认打印设备 ID，之后在网页「设备设置」里改 ----
+      - PRINTER_ID=0482:0d44
+      # ---- 首次启动的默认推送参数，之后统一在网页「推送配置」里改 ----
+      - PUSHPLUS_TOKEN=
+      - PUSHPLUS_CHANNEL=wechat
+      - PUSHPLUS_OPTION=
+      - PUSHPLUS_TO=
+      - PUSHPLUS_TOPIC=
+      - PUSH_ENABLE=1
+      - OFFLINE_ALERT_SEC=60
+      - JOB_FAIL_PUSH=1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
