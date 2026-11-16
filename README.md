@@ -28,10 +28,30 @@ docker compose pull
 docker compose up -d
 ```
 
-镜像地址：`ghcr.io/meyzh/p910nd-panel:latest`
+镜像地址：`registry.cn-hangzhou.aliyuncs.com/godr/p910nd-panel:latest`（阿里云 ACR，国内拉取快，公开可免登录拉取）
 
-> 拉取报权限错误，说明镜像包还是私有：GitHub → Packages → p910nd-panel → Package settings → 改为 Public。
-> 国内网络拉 GHCR 慢，可改用阿里云 ACR 或自建仓库，把 `.env` 里的 `PANEL_IMAGE` 换掉即可。
+### 按设备架构选标签
+
+阿里云 ACR 个人版不支持多架构清单，所以每个架构单独一个标签：
+
+| 标签 | 架构 | 适用设备 |
+|---|---|---|
+| `:latest` / `:amd64` | x86_64 | 绝大多数 NAS、台式机、迷你主机 |
+| `:arm64` | ARM 64 位 | 树莓派 4/5、ARM 版群晖/极空间 |
+| `:arm-v7` | ARM 32 位 | 树莓派 2/3、老 ARM 盒子 |
+| `:386` | x86 32 位 | 老 PC、32 位工控机 |
+
+不确定自己是哪个架构，在设备上执行 `uname -m`：
+`x86_64` → amd64；`aarch64` → arm64；`armv7l` → arm-v7；`i686` → 386。
+
+改架构只改 `.env` 里的 `PANEL_IMAGE` 标签，例如 32 位 ARM：
+
+```ini
+PANEL_IMAGE=registry.cn-hangzhou.aliyuncs.com/godr/p910nd-panel:arm-v7
+```
+
+> 备用地址（GHCR）：`ghcr.io/meyzh/p910nd-panel:latest`，它支持多架构清单，一条地址四个架构自动匹配，不用挑标签。
+> 拉取报权限错误说明包还是私有：GitHub → Packages → p910nd-panel → Package settings → 改为 Public。
 
 ### 方式二：从源码构建
 
@@ -58,6 +78,9 @@ docker compose logs -f
 | `.env.example` | 镜像地址、端口、推送等可覆盖参数 |
 | `.github/workflows/build.yml` | 推送到 main 自动构建镜像 → GHCR |
 | `.github/workflows/build-acr.yml` | 手动触发，构建镜像 → 阿里云 ACR |
+| `部署文档.md` | 单机部署的完整步骤 |
+| `远端部署.md` | 部署到另一台远端机器的完整步骤（含跨网访问、客户端添加） |
+| `LICENSE` | 使用许可：禁止商业用途，二次开发须保留版权 |
 | `data/` | 持久化目录（配置、任务记录、统计），**不入库** |
 
 ## 数据与配置
