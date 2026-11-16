@@ -912,6 +912,78 @@ button:active{transform:scale(.98)}
 .note{font-size:12px;color:var(--sub);margin-top:16px;line-height:1.7;background:#f7fafc;border:1px solid var(--line);border-radius:10px;padding:11px 13px}
 """
 
+# ==================== 页脚版权 ====================
+
+FOOTER_HTML = (
+    '<div class="foot">© '
+    '<a href="https://www.godr.cn/" target="_blank" rel="noopener">亦桉</a>'
+    ' · 保留所有权利'
+    '<div class="foot2">未经许可禁止商业用途，二次开发须保留本版权信息'
+    ' · <a href="/license">查看许可</a></div>'
+    '</div>'
+)
+
+FOOTER_CSS = (
+    '.foot{text-align:center;font-size:12px;color:var(--sub);margin:16px 0 4px;line-height:1.8}'
+    '.foot a{color:var(--brand);text-decoration:none}'
+    '.foot a:hover{text-decoration:underline}'
+    '.foot2{font-size:11.5px;color:#98a3b1;margin-top:5px;line-height:1.7}'
+    '.foot2 a{color:#98a3b1;text-decoration:underline}'
+)
+
+# 登录页 / 首次设置页的 body 是 flex 居中的，页脚要固定在底部居中，不能作为 flex 子项横排
+AUTH_FOOTER_CSS = (
+    FOOTER_CSS
+    + '.foot{position:fixed;left:0;right:0;bottom:12px;margin:0;padding:0 16px;'
+      'text-align:center;z-index:2}'
+)
+
+LICENSE_TEXT = """p910nd-panel 使用许可与声明
+Copyright (c) 2026 亦桉 · https://www.godr.cn/
+All rights reserved. 保留所有权利。
+
+使用、复制、修改或分发本项目的任何部分，即表示你已阅读并同意以下条款。
+
+一、允许的使用
+1. 个人学习、研究、测试与自用部署。
+2. 非营利组织、社区、学校的内部自用部署。
+3. 在完整保留本声明的前提下，复制、修改、二次开发与非商业性再分发。
+
+二、禁止商业用途
+1. 未经版权所有者书面许可，不得将本项目或其实质性部分用于任何商业用途，
+   包括但不限于：
+   - 销售本项目，或以本项目为核心卖点销售商品、服务、解决方案；
+   - 提供付费部署、代运维、技术支持等收费服务；
+   - 以 SaaS、云打印、按次收费等形式对外提供本项目的功能；
+   - 预装或捆绑进对外销售的硬件、整机、系统镜像；
+   - 以本项目为主要内容开展培训、课程、付费社群并获利。
+2. 商业授权需单独取得书面许可，联系方式见 https://www.godr.cn/ 。
+
+三、版权与署名必须保留
+1. 不得移除、隐藏、篡改本项目中的版权声明与作者署名，包括但不限于：
+   源码文件中的版权注释、网页界面底部的版权信息（© 亦桉 及指向
+   https://www.godr.cn/ 的链接）、README 与许可证文件。
+2. 二次开发、修改、衍生版本在分发或以任何形式对外提供时，必须：
+   - 完整保留许可证文件与原作者版权声明；
+   - 在显著位置注明「基于 p910nd-panel（https://www.godr.cn/）修改」；
+   - 保留网页界面底部的原作者版权信息，不得删除或替换为他人署名。
+3. 衍生作品继续受本许可约束，不得单方面改为 MIT、Apache-2.0 等更宽松的
+   许可，除非取得版权所有者的书面同意。
+4. 不得以原作者名义对外宣传，或暗示原作者对衍生作品提供担保、背书。
+
+四、免责声明
+本软件按「现状」提供，不提供任何明示或暗示的担保，包括但不限于适销性、
+特定用途适用性与不侵权的担保。在任何情况下，作者或版权持有人均不对因使用
+本软件或与本软件相关的行为所产生的任何索赔、损害或其他责任负责。
+
+五、许可终止
+违反上述任何条款，本许可自动终止，你须立即停止使用并删除全部副本。
+
+Non-commercial use only. Commercial use requires prior written permission
+from the copyright holder. The copyright notice and author attribution
+(including the footer credit "© 亦桉" linking to https://www.godr.cn/)
+must be retained in all copies and derivative works."""
+
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -932,6 +1004,7 @@ LOGIN_HTML = """<!DOCTYPE html>
   </form>
   <div class="note">忘记密码：删除容器数据目录里的 <b>data/config.json</b> 后重启，会重新进入首次设置流程（打印记录与推送配置也会一起重置）。</div>
 </div>
+%FOOTER%
 </body>
 </html>
 """
@@ -958,6 +1031,7 @@ SETUP_HTML = """<!DOCTYPE html>
   </form>
   <div class="note">密码只以 PBKDF2 加盐哈希保存在服务器本地，不会写入任何环境变量或日志，也无法被反推出明文；日志里只记录登录成功/失败和来源 IP。</div>
 </div>
+%FOOTER%
 </body>
 </html>
 """
@@ -1042,6 +1116,7 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
 .logbox{background:#0f1720;color:#7ee0a4;border-radius:12px;padding:14px;height:280px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:13px;line-height:1.65;white-space:pre-wrap}
 .foot{text-align:center;font-size:12px;color:var(--sub);margin:16px 0 4px}
 @media (max-width:560px){.title{font-size:17px}.stat .v{font-size:17px}button{flex:1 1 45%}}
+%FOOTER_CSS%
 </style>
 </head>
 <body>
@@ -1250,6 +1325,7 @@ refresh();
 loadStats(true);
 startTimer();
 </script>
+%FOOTER%
 </body>
 </html>
 """
@@ -1334,14 +1410,16 @@ def settings_page(title, active, body, script=""):
   </div>
 </div>
 <script>%SCRIPT%</script>
+%FOOTER%
 </body>
 </html>
 """
-    return (html.replace("%STYLE%", SETTINGS_CSS)
+    return (html.replace("%STYLE%", SETTINGS_CSS + FOOTER_CSS)
                 .replace("%NAV%", nav)
                 .replace("%TITLE%", title)
                 .replace("%BODY%", body)
-                .replace("%SCRIPT%", script))
+                .replace("%SCRIPT%", script)
+                .replace("%FOOTER%", FOOTER_HTML))
 
 
 DEVICE_BODY = """
@@ -1573,12 +1651,16 @@ app.permanent_session_lifetime = datetime.timedelta(hours=SESSION_HOURS)
 
 def login_page(err=""):
     block = ('<div class="err">%s</div>' % err) if err else ""
-    return LOGIN_HTML.replace("%STYLE%", AUTH_STYLE).replace("%ERR%", block)
+    return (LOGIN_HTML.replace("%STYLE%", AUTH_STYLE + AUTH_FOOTER_CSS)
+                      .replace("%ERR%", block)
+                      .replace("%FOOTER%", FOOTER_HTML))
 
 
 def setup_page(err=""):
     block = ('<div class="err">%s</div>' % err) if err else ""
-    return SETUP_HTML.replace("%STYLE%", AUTH_STYLE).replace("%ERR%", block)
+    return (SETUP_HTML.replace("%STYLE%", AUTH_STYLE + AUTH_FOOTER_CSS)
+                      .replace("%ERR%", block)
+                      .replace("%FOOTER%", FOOTER_HTML))
 
 
 def client_ip():
@@ -1588,7 +1670,7 @@ def client_ip():
 @app.before_request
 def require_login():
     path = request.path
-    if path == "/favicon.ico" or path == "/robots.txt":
+    if path in ("/favicon.ico", "/robots.txt", "/license"):
         return None
 
     ready = auth_ready()
@@ -1673,6 +1755,51 @@ def robots():
     return Response("User-agent: *\nDisallow: /\n", mimetype="text/plain")
 
 
+@app.route("/license")
+def page_license():
+    text = (LICENSE_TEXT.replace("&", "&amp;")
+                       .replace("<", "&lt;")
+                       .replace(">", "&gt;"))
+    html = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>使用许可与声明 · USB 打印服务面板</title>
+<style>
+:root{--bg:#f2f5f9;--card:#fff;--line:#e3e8ef;--txt:#1b2530;--sub:#63707e;--brand:#0a84ff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:var(--txt);padding:22px 16px}
+.wrap{max-width:760px;margin:0 auto}
+.top{margin-bottom:14px}
+.top a{font-size:13px;color:var(--brand);text-decoration:none}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px 22px;box-shadow:0 8px 24px rgba(20,40,70,.06)}
+h1{font-size:17px;font-weight:600;margin-bottom:14px}
+pre{white-space:pre-wrap;word-break:break-word;font-family:inherit;font-size:13px;line-height:1.85;color:var(--txt)}
+.foot{text-align:center;font-size:12px;color:var(--sub);margin:16px 0 4px;line-height:1.8}
+.foot a{color:var(--brand);text-decoration:none}
+.foot a:hover{text-decoration:underline}
+.foot2{font-size:11.5px;color:#98a3b1;margin-top:5px;line-height:1.7}
+.foot2 a{color:#98a3b1;text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top"><a href="/">← 返回面板</a></div>
+  <div class="card">
+    <h1>使用许可与声明</h1>
+    <pre>%TEXT%</pre>
+  </div>
+  %FOOTER%
+</div>
+</body>
+</html>
+"""
+    return Response(html.replace("%TEXT%", text)
+                        .replace("%FOOTER%", FOOTER_HTML.replace(' · <a href="/license">查看许可</a>', '')),
+                    mimetype="text/html")
+
+
 @app.route("/favicon.ico")
 def favicon():
     return Response(status=204)
@@ -1680,7 +1807,8 @@ def favicon():
 
 @app.route("/")
 def index():
-    return Response(HTML, mimetype="text/html")
+    return Response(HTML.replace("%FOOTER_CSS%", FOOTER_CSS).replace("%FOOTER%", FOOTER_HTML),
+                    mimetype="text/html")
 
 
 @app.route("/device")
