@@ -19,6 +19,7 @@ import hmac
 import json
 import os
 import socket
+import sys
 import threading
 import time
 import urllib.request
@@ -50,6 +51,9 @@ DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 JOBS_PATH = os.path.join(DATA_DIR, "jobs.json")
 STATS_PATH = os.path.join(DATA_DIR, "stats.json")
+LOG_PATH = os.path.join(DATA_DIR, "panel.log")
+LOG_KEEP_LINES = 3000          # 启动时从日志文件载入最近多少行
+LOG_FILE_LIMIT = 1024 * 1024   # 日志文件超过 1 MB 就压缩回最近 LOG_KEEP_LINES 行
 PUSH_API = "https://www.pushplus.plus/send"
 PUSH_BATCH_API = "https://www.pushplus.plus/batchSend"
 
@@ -75,7 +79,7 @@ JOB_FAIL_COOLDOWN = 600
 START_TS = time.time()
 SPEED_MAP = {0: "未知", 1: "1.5 Mbps", 2: "12 Mbps", 3: "480 Mbps", 4: "5 Gbps", 5: "10 Gbps"}
 
-logs = collections.deque(maxlen=400)
+logs = []          # 进程内全量保留：只要容器没重启，日志一条都不丢
 lock = threading.RLock()
 cfg_lock = threading.RLock()
 jobs_lock = threading.RLock()
@@ -103,11 +107,50 @@ push_info = {"count": 0, "last_time": "", "last_result": "", "last_title": ""}
 
 # ==================== 日志 ====================
 
+_log_writes = [0]
+
+
+def _trim_log_file():
+    """日志文件过大时压回最近 LOG_KEEP_LINES 行，避免无限增长。"""
+    try:
+        if os.path.getsize(LOG_PATH) <= LOG_FILE_LIMIT:
+            return
+        with open(LOG_PATH, encoding="utf-8", errors="replace") as fh:
+            tail = fh.read().splitlines()[-LOG_KEEP_LINES:]
+        with open(LOG_PATH, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(tail) + "\n")
+    except Exception:
+        pass
+
+
 def log(msg):
     line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
     with lock:
         logs.append(line)
+        # 同时写进 data/panel.log：进程被自动/手动重启后还能看到重启前的记录
+        try:
+            if not os.path.isdir(DATA_DIR):
+                os.makedirs(DATA_DIR)
+            with open(LOG_PATH, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            _log_writes[0] += 1
+            if _log_writes[0] % 200 == 0:
+                _trim_log_file()
+        except Exception:
+            pass
     print(line, flush=True)
+
+
+def load_log_history():
+    """启动时把上一次运行留在 panel.log 里的日志载回内存。"""
+    try:
+        with open(LOG_PATH, encoding="utf-8", errors="replace") as fh:
+            tail = fh.read().splitlines()[-LOG_KEEP_LINES:]
+    except Exception:
+        return 0
+    with lock:
+        logs.extend(tail)
+    return len(tail)
 
 
 def set_state(**kwargs):
@@ -469,11 +512,27 @@ class UsbPrinter(object):
         self.iface_num = None
         self.sig = None
         self.io_lock = threading.Lock()
+        self._fail_log = {"msg": "", "ts": 0}
+        self._last_reset = 0
 
     def _find_dev(self):
         if not PYUSB_OK:
             return None
         try:
+            # 每次查找都新建一个 libusb backend，等价于新建 libusb 上下文：
+            # 拔插后进程里旧上下文缓存的设备列表会指向已经不存在的句柄，
+            # 继续用它读配置就会一直是 Errno 5。
+            backend = None
+            try:
+                import usb.backend.libusb1 as _libusb1
+                backend = _libusb1.get_backend()
+            except Exception:
+                backend = None
+            if backend is not None:
+                try:
+                    return usb.core.find(idVendor=VID, idProduct=PID, backend=backend)
+                except Exception:
+                    pass
             return usb.core.find(idVendor=VID, idProduct=PID)
         except Exception as exc:
             log("USB 设备查找失败：%s" % exc)
@@ -511,85 +570,326 @@ class UsbPrinter(object):
     def is_ready(self):
         return self.ep_out is not None
 
+    def _log_fail(self, msg):
+        """同一类 USB 错误 60 秒内只记一条，避免日志被刷屏"""
+        now = time.time()
+        last = self._fail_log
+        if msg == last.get("msg") and now - last.get("ts", 0) < 60:
+            last["ts"] = now
+            return
+        self._fail_log = {"msg": msg, "ts": now}
+        log(msg)
+
+    def _config_for(self, dev):
+        """取设备配置描述符。
+
+        拔插之后部分打印机（尤其京瓷这类）的 GET_CONFIGURATION 控制传输会持续
+        返回 Errno 5，导致 get_active_configuration 和 set_configuration 都失败。
+        这里只做「不改变设备状态」的两次尝试；都失败则返回 None，
+        由调用方改用 sysfs 端点直写（那条路不发任何控制请求）。
+        """
+        err = None
+        try:
+            return dev.get_active_configuration(), "", None
+        except Exception as exc:
+            err = exc
+        try:
+            dev.set_configuration()
+            return dev.get_active_configuration(), "", None
+        except Exception as exc:
+            err = exc
+        # 注意：这里不再做 USB reset。reset 会让内核重新枚举、旧句柄直接失效，
+        # 反而把设备推进“控制传输一直 EIO”的状态。
+        return None, "", err
+
+    def diag(self):
+        """把 USB 现场信息整理成若干行日志，用来自查连不上的原因。"""
+        out = ["目标设备 ID：%s" % PRINTER_ID]
+        if not PYUSB_OK:
+            out.append("pyusb 不可用：%s" % PYUSB_ERROR)
+            return out
+        try:
+            devs = list(usb.core.find(find_all=True))
+            out.append("libusb 枚举到 %d 个设备" % len(devs))
+        except Exception as exc:
+            out.append("libusb 枚举失败：%s" % exc)
+            return out
+        want = (PRINTER_ID or "").strip().lower()
+        hit = 0
+        for d in devs:
+            try:
+                cur = "%04x:%04x" % (d.idVendor, d.idProduct)
+            except Exception:
+                continue
+            if cur != want:
+                continue
+            hit += 1
+            node = "/dev/bus/usb/%03d/%03d" % (d.bus, d.address)
+            try:
+                st = os.stat(node)
+                out.append("设备 %s 在 %s，权限 %s" % (cur, node, oct(st.st_mode & 0o777)))
+            except Exception as exc:
+                out.append("设备 %s 应为 %s，但 stat 失败：%s" % (cur, node, exc))
+            try:
+                cfg = d.get_active_configuration()
+                out.append("读取活动配置：成功（bConfigurationValue=%s）" % cfg.bConfigurationValue)
+            except Exception as exc:
+                out.append("读取活动配置：失败 %s" % exc)
+            try:
+                usb.util.dispose_resources(d)
+            except Exception:
+                pass
+        if not hit:
+            out.append("枚举列表里找不到该设备（可能已物理拔出，或主机没重新枚举）")
+        try:
+            sp = self._sysfs_endpoint(VID, PID)
+            if sp:
+                out.append("sysfs 端点：接口 %d，输出端点 0x%02x（可直写）" % (sp[0], sp[1]))
+            else:
+                out.append("sysfs 端点：未取到（/sys/bus/usb/devices 里没有匹配的打印接口）")
+        except Exception as exc:
+            out.append("sysfs 端点读取异常：%s" % exc)
+        return out
+
+    def _purge(self):
+        """丢弃进程内所有 pyusb 设备句柄。
+
+        拔插之后旧句柄指向的设备已经不存在，继续用它会持续返回 Errno 5；
+        清一遍再重新查找，等价于“不重启容器”的重新枚举。
+        """
+        try:
+            for d in usb.core.find(find_all=True):
+                try:
+                    usb.util.dispose_resources(d)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    @staticmethod
+    def _sysfs_present(vid, pid):
+        """设备是否还挂在系统上：直接看 sysfs 里有没有这个 VID/PID。
+
+        拔线后 libusb 的旧句柄可能还在枚举列表里（返回的是幽灵设备），
+        但 /sys/bus/usb/devices 下的目录会立刻消失，所以这是最可靠的“拔掉了”判据。
+        返回 True（在）/ False（不在）/ None（读不到 sysfs，无法判断）。
+        """
+        base = "/sys/bus/usb/devices"
+        try:
+            names = os.listdir(base)
+        except Exception:
+            return None
+        want_v = "%04x" % vid
+        want_p = "%04x" % pid
+        for name in names:
+            path = os.path.join(base, name)
+            try:
+                with open(os.path.join(path, "idVendor")) as fh:
+                    v = fh.read().strip()
+                with open(os.path.join(path, "idProduct")) as fh:
+                    p = fh.read().strip()
+            except Exception:
+                continue
+            if v.lower() == want_v and p.lower() == want_p:
+                return True
+        return False
+
+    def sysfs_present(self):
+        return self._sysfs_present(VID, PID)
+
+    @staticmethod
+    def _sysfs_endpoint(vid, pid):
+        """不依赖 USB 控制传输，直接从 sysfs 读出打印接口号和输出端点地址。
+
+        拔插后设备可能连 GET_CONFIGURATION 都返回 EIO，但只要设备在，
+        sysfs 里的 bInterfaceClass / bEndpointAddress 一定读得到。
+        返回 (bInterfaceNumber, bEndpointAddress) 或 None。
+        """
+        base = "/sys/bus/usb/devices"
+        try:
+            names = os.listdir(base)
+        except Exception:
+            return None
+        want_v = "%04x" % vid
+        want_p = "%04x" % pid
+        for name in names:
+            path = os.path.join(base, name)
+            try:
+                with open(os.path.join(path, "idVendor")) as fh:
+                    v = fh.read().strip()
+                with open(os.path.join(path, "idProduct")) as fh:
+                    p = fh.read().strip()
+            except Exception:
+                continue
+            if v.lower() != want_v or p.lower() != want_p:
+                continue
+            try:
+                children = os.listdir(path)
+            except Exception:
+                continue
+            for child in children:
+                if ":" not in child:
+                    continue
+                sub = os.path.join(path, child)
+                try:
+                    with open(os.path.join(sub, "bInterfaceClass")) as fh:
+                        cls = int(fh.read().strip(), 16)
+                    with open(os.path.join(sub, "bInterfaceNumber")) as fh:
+                        num = int(fh.read().strip(), 16)
+                except Exception:
+                    continue
+                if cls != 7:
+                    continue
+                try:
+                    eps = os.listdir(sub)
+                except Exception:
+                    eps = []
+                for ep in eps:
+                    if not ep.startswith("ep_"):
+                        continue
+                    try:
+                        with open(os.path.join(sub, ep, "bEndpointAddress")) as fh:
+                            addr = int(fh.read().strip(), 16)
+                        with open(os.path.join(sub, ep, "type")) as fh:
+                            typ = int(fh.read().strip(), 16)
+                    except Exception:
+                        continue
+                    if typ != 2:          # 2 = Bulk
+                        continue
+                    if addr & 0x80:       # 0x80 置位是 IN，跳过
+                        continue
+                    return num, addr
+        return None
+
+    def _open_once(self, dev, silent=False):
+        cfg, how, cerr = self._config_for(dev)
+        if cfg is None:
+            # 控制传输全挂：改用 sysfs 端点 + usbfs 直接 bulk 写，完全不发控制请求
+            hit = self._sysfs_endpoint(VID, PID)
+            if hit:
+                num, addr = hit
+                try:
+                    usb.util.claim_interface(dev, num)
+                except Exception as exc:
+                    self._log_fail("控制传输失败且接口占用失败：%s" % exc)
+                    return False
+                self.dev = dev
+                self.iface_num = num
+                self.ep_out = addr
+                self.sig = "%s-%s" % (getattr(dev, "bus", ""), getattr(dev, "address", ""))
+                set_state(
+                    usb_online=True,
+                    printer_name=self._get_product(dev),
+                    usb_bus=str(getattr(dev, "bus", "-")),
+                    usb_addr=str(getattr(dev, "address", "-")),
+                    usb_speed=self._speed_text(dev),
+                    last_error="",
+                )
+                log("USB 控制传输异常，已改用 sysfs 端点 0x%02x 直写连接：%s" % (addr, cerr))
+                self._fail_log = {"msg": "", "ts": 0}
+                return True
+            self._log_fail("读取 USB 配置失败：%s（sysfs 也取不到端点）" % cerr)
+            return False
+        if how == "cached":
+            self._log_fail("USB 控制传输异常，已改用枚举缓存的配置描述符连接：%s" % cerr)
+
+        iface = None
+        try:
+            for itf in cfg:
+                if itf.bInterfaceClass == 7:
+                    iface = itf
+                    break
+        except Exception:
+            iface = None
+        if iface is None:
+            try:
+                iface = cfg[(0, 0)]
+            except Exception as exc:
+                log("USB 接口解析失败：%s" % exc)
+                return False
+
+        try:
+            if dev.is_kernel_driver_active(iface.bInterfaceNumber):
+                dev.detach_kernel_driver(iface.bInterfaceNumber)
+        except Exception:
+            pass
+
+        try:
+            usb.util.claim_interface(dev, iface.bInterfaceNumber)
+        except Exception as exc:
+            # 退回缓存描述符时设备可能还没被配置，先显式设置一次再占用
+            try:
+                dev.set_configuration(cfg.bConfigurationValue)
+                usb.util.claim_interface(dev, iface.bInterfaceNumber)
+            except Exception:
+                self._log_fail("占用 USB 接口失败（可能被其他程序占用）：%s" % exc)
+                return False
+
+        try:
+            ep_out = usb.util.find_descriptor(
+                iface,
+                custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
+                == usb.util.ENDPOINT_OUT,
+            )
+        except Exception:
+            ep_out = None
+        if ep_out is None:
+            log("未找到打印机的 USB 输出端点")
+            try:
+                usb.util.release_interface(dev, iface.bInterfaceNumber)
+            except Exception:
+                pass
+            return False
+
+        self.dev = dev
+        self.ep_out = ep_out
+        self.iface_num = iface.bInterfaceNumber
+        self.sig = "%s-%s" % (getattr(dev, "bus", ""), getattr(dev, "address", ""))
+
+        product = self._get_product(dev)
+        set_state(
+            usb_online=True,
+            printer_name=product,
+            usb_bus=str(getattr(dev, "bus", "-")),
+            usb_addr=str(getattr(dev, "address", "-")),
+            usb_speed=self._speed_text(dev),
+            last_error="",
+        )
+        log("打印机已连接：%s（%s）" % (product or "USB 打印机", PRINTER_ID))
+        self._fail_log = {"msg": "", "ts": 0}
+        return True
+
     def connect(self, dev=None, silent=False):
         with self.io_lock:
             self._close()
-            dev = dev or self._find_dev()
-            if dev is None:
-                set_state(usb_online=False, printer_name="", usb_bus="", usb_addr="", usb_speed="")
-                if not silent:
-                    log("未检测到打印机 %s" % PRINTER_ID)
-                return False
-
-            try:
-                cfg = dev.get_active_configuration()
-            except Exception:
-                try:
-                    dev.set_configuration()
-                    cfg = dev.get_active_configuration()
-                except Exception as exc:
-                    log("读取 USB 配置失败：%s" % exc)
+            for attempt in (0, 1):
+                cur = dev or self._find_dev()
+                if cur is None:
+                    set_state(usb_online=False, printer_name="", usb_bus="", usb_addr="", usb_speed="")
+                    if not silent:
+                        log("未检测到打印机 %s" % PRINTER_ID)
                     return False
-
-            iface = None
-            try:
-                for itf in cfg:
-                    if itf.bInterfaceClass == 7:
-                        iface = itf
-                        break
-            except Exception:
-                iface = None
-            if iface is None:
+                if self._open_once(cur, silent=silent):
+                    return True
                 try:
-                    iface = cfg[(0, 0)]
-                except Exception as exc:
-                    log("USB 接口解析失败：%s" % exc)
-                    return False
-
-            try:
-                if dev.is_kernel_driver_active(iface.bInterfaceNumber):
-                    dev.detach_kernel_driver(iface.bInterfaceNumber)
-            except Exception:
-                pass
-
-            try:
-                usb.util.claim_interface(dev, iface.bInterfaceNumber)
-            except Exception as exc:
-                log("占用 USB 接口失败（可能被其他程序占用）：%s" % exc)
-                return False
-
-            try:
-                ep_out = usb.util.find_descriptor(
-                    iface,
-                    custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
-                    == usb.util.ENDPOINT_OUT,
-                )
-            except Exception:
-                ep_out = None
-            if ep_out is None:
-                log("未找到打印机的 USB 输出端点")
-                try:
-                    usb.util.release_interface(dev, iface.bInterfaceNumber)
+                    usb.util.dispose_resources(cur)
                 except Exception:
                     pass
-                return False
-
-            self.dev = dev
-            self.ep_out = ep_out
-            self.iface_num = iface.bInterfaceNumber
-            self.sig = "%s-%s" % (getattr(dev, "bus", ""), getattr(dev, "address", ""))
-
-            product = self._get_product(dev)
+                if attempt == 0:
+                    # 第一次失败：清掉所有旧句柄后重新查找再试一次
+                    self._purge()
+                    dev = None
+                    time.sleep(0.5)
+            # 两次都没连上：状态必须落回“未连接”，否则面板会一直显示已连接
             set_state(
-                usb_online=True,
-                printer_name=product,
-                usb_bus=str(getattr(dev, "bus", "-")),
-                usb_addr=str(getattr(dev, "address", "-")),
-                usb_speed=self._speed_text(dev),
-                last_error="",
+                usb_online=False,
+                printer_name="",
+                usb_bus="",
+                usb_addr="",
+                usb_speed="",
+                last_error="USB 设备无法连接（%s）" % PRINTER_ID,
             )
-            log("打印机已连接：%s（%s）" % (product or "USB 打印机", PRINTER_ID))
-            return True
+            return False
 
     def disconnect(self, reason=""):
         with self.io_lock:
@@ -614,7 +914,11 @@ class UsbPrinter(object):
                 retry = 0
                 while True:
                     try:
-                        written = self.ep_out.write(buf, timeout=USB_TIMEOUT_MS)
+                        if isinstance(self.ep_out, int):
+                            # sysfs 端点模式：用设备句柄按端点地址直接 bulk 写，不经过描述符
+                            written = self.dev.write(self.ep_out, buf, timeout=USB_TIMEOUT_MS)
+                        else:
+                            written = self.ep_out.write(buf, timeout=USB_TIMEOUT_MS)
                         break
                     except Exception as exc:
                         retry += 1
@@ -788,7 +1092,15 @@ def handle_job(conn, addr):
             total += len(data)
     except Exception as exc:
         ok = False
-        set_state(last_error=str(exc))
+        printer.disconnect()
+        set_state(
+            usb_online=False,
+            printer_name="",
+            usb_bus="",
+            usb_addr="",
+            usb_speed="",
+            last_error=str(exc),
+        )
         record["msg"] = str(exc)
         log("打印任务失败（来源 %s）：%s" % (ip, exc))
         notify_job_fail(peer, str(exc), total)
@@ -836,28 +1148,82 @@ def print_server_loop():
 
 offline_since = None
 offline_alerted = False
+connect_fail_streak = 0
+
+
+def restart_self(force=False):
+    """原地重启本进程。
+
+    等价于 docker compose restart：挂载和容器都不动，只让进程重来一遍，
+    libusb 上下文、句柄、设备列表全部重建。
+    自动触发时限流 10 分钟一次；手动点击（force=True）不受限制。
+    """
+    if not force:
+        mark = os.path.join(DATA_DIR, ".last_autorestart")
+        try:
+            last = os.path.getmtime(mark) if os.path.exists(mark) else 0
+        except Exception:
+            last = 0
+        if time.time() - last < 600:
+            return
+        try:
+            with open(mark, "w", encoding="utf-8") as fh:
+                fh.write(str(int(time.time())))
+        except Exception:
+            pass
+        log("USB 连续失败 4 次，自动重启进程以重新初始化 USB 子系统")
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as exc:
+        log("重启进程失败：%s" % exc)
 
 
 def watcher_loop():
-    global offline_since, offline_alerted
+    global offline_since, offline_alerted, connect_fail_streak
     if not PYUSB_OK:
         log("pyusb 不可用（%s），USB 打印功能无法启用" % PYUSB_ERROR)
 
+    present_prev = None      # 上一轮 sysfs 里是否看得到设备，用来识别“刚被拔掉”
     while True:
         dev = None
+        present = None
         try:
             if PYUSB_OK:
-                dev = printer._find_dev()
+                present = printer.sysfs_present()
+                # sysfs 明确说设备不在了，就不用再问 libusb（它会给回幽灵句柄）
+                if present is not False:
+                    dev = printer._find_dev()
         except Exception as exc:
             log("USB 守护线程异常：%s" % exc)
+
+        just_vanished = (present is False and present_prev is True)
+        if just_vanished:
+            log("打印机已拔出：USB 设备已从系统移除（%s）" % PRINTER_ID)
+        present_prev = present
 
         try:
             conf = push_conf()
             alert_sec = int(conf.get("offline_alert_sec") or 60)
             if dev is None:
-                if state["usb_online"]:
-                    set_state(usb_online=False, printer_name="", usb_bus="", usb_addr="", usb_speed="")
-                    printer.disconnect("打印机已断开")
+                connect_fail_streak = 0
+                # 只要之前连过（状态里是已连接，或句柄还没释放），就记一条断开日志
+                if state["usb_online"] or printer.ep_out is not None:
+                    printer.disconnect()
+                    set_state(
+                        usb_online=False,
+                        printer_name="",
+                        usb_bus="",
+                        usb_addr="",
+                        usb_speed="",
+                        last_error="未检测到打印机（%s）" % PRINTER_ID,
+                    )
+                    if not just_vanished:
+                        log("打印机已断开：未检测到 %s，等待重新插入" % PRINTER_ID)
                 if offline_since is None:
                     offline_since = time.time()
                 if (not offline_alerted) and push_ready() and (time.time() - offline_since) >= alert_sec:
@@ -889,10 +1255,22 @@ def watcher_loop():
                 if not printer.is_ready() or printer.sig != cur_sig:
                     with lock:
                         state["reconnects"] += 1
-                    printer.connect(dev=dev, silent=True)
+                    ok = printer.connect(dev=dev, silent=True)
+                    if ok:
+                        connect_fail_streak = 0
+                    else:
+                        connect_fail_streak += 1
+                        if connect_fail_streak == 2:
+                            log("USB 连接连续失败，已清理旧句柄并准备重启进程重试")
+                        if connect_fail_streak >= 4:
+                            restart_self()
         except Exception as exc:
             log("USB 守护线程异常：%s" % exc)
-        time.sleep(3)
+        # 正常时 3 秒一次；连续失败时逐步拉长到 30 秒，避免反复操作把设备弄僵
+        if connect_fail_streak:
+            time.sleep(min(3 + 3 * connect_fail_streak, 30))
+        else:
+            time.sleep(3)
 
 
 # ==================== 登录页 / 首次设置密码 ====================
@@ -1083,6 +1461,12 @@ button:active{transform:scale(.97)}
 h3{font-size:15px;font-weight:600;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;gap:10px}
 h3 .hint{font-size:12px;color:var(--sub);font-weight:400}
 .tblwrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}
+.pager{display:flex;align-items:center;justify-content:flex-end;gap:10px;margin-top:10px;font-size:12.5px;color:var(--sub);flex-wrap:wrap}
+.pager button{padding:7px 13px;border:1px solid var(--line);background:#fbfcfd;color:var(--txt);border-radius:9px;font-size:12.5px;font-weight:500;margin:0}
+.pager button:disabled{opacity:.45;cursor:default}
+.pager button:active:not(:disabled){transform:scale(.97)}
+.pager .pgsize{margin-right:auto;display:inline-flex;align-items:center;gap:6px;color:var(--sub)}
+.pager select{padding:6px 9px;border:1px solid var(--line);border-radius:9px;font-size:12.5px;background:#fbfcfd;color:var(--txt)}
 .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
 .toolbar select{padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:13px;background:#fbfcfd;color:var(--txt)}
 .legend{display:flex;gap:18px;font-size:12.5px;color:var(--sub);margin-bottom:8px}
@@ -1161,6 +1545,7 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
       <button class="b2" onclick="reconnect()">重连打印机</button>
       <button class="b3" onclick="testpage()">打印测试页</button>
       <button class="b2" onclick="pushtest()">测试推送</button>
+      <button class="b4" onclick="restartPanel()">重启服务</button>
       <button class="b4" id="autobtn" onclick="toggleAuto()">自动刷新：开</button>
     </div>
   </div>
@@ -1183,17 +1568,31 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
   </div>
 
   <div class="card mt">
-    <h3>打印监控 <span class="hint">最近 100 条任务，含来源机器</span></h3>
+    <h3>打印监控 <span class="hint" id="jobhint">最近 100 条任务，含来源机器</span></h3>
     <div class="tblwrap">
       <table>
         <thead><tr><th>时间</th><th>来源 IP</th><th>来源主机</th><th>数据量</th><th>耗时</th><th>结果</th></tr></thead>
         <tbody id="jobbody"><tr><td colspan="6" class="empty">暂无任务记录</td></tr></tbody>
       </table>
     </div>
+    <div class="pager">
+      <label class="pgsize">每页
+        <select id="jobsize" onchange="setJobPageSize(this.value)">
+          <option value="10">10</option>
+          <option value="20">20</option>
+          <option value="30">30</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select> 条
+      </label>
+      <span class="pginfo" id="jobpageinfo">共 0 条</span>
+      <button id="jobprev" onclick="jobPage(-1)">上一页</button>
+      <button id="jobnext" onclick="jobPage(1)">下一页</button>
+    </div>
   </div>
 
   <div class="card mt">
-    <h3>运行日志</h3>
+    <h3>运行日志 <span class="hint" id="loghint">写入 data/panel.log，重启后仍保留</span></h3>
     <div class="logbox" id="logbox">加载中...</div>
   </div>
   <div class="foot">RAW 打印地址 tcp://本机IP:9100</div>
@@ -1267,6 +1666,57 @@ function clearJobs(){
   });
 }
 
+var JOB_PAGE_SIZES = [10, 20, 30, 50, 100];
+var jobPageSize = 10, jobCache = [], jobPageNo = 0;
+
+try{
+  var _sz = parseInt(localStorage.getItem("job_page_size"), 10);
+  if(JOB_PAGE_SIZES.indexOf(_sz) >= 0) jobPageSize = _sz;
+}catch(e){}
+
+function setJobPageSize(v){
+  var n = parseInt(v, 10);
+  if(JOB_PAGE_SIZES.indexOf(n) < 0) n = 10;
+  jobPageSize = n;
+  jobPageNo = 0;
+  try{ localStorage.setItem("job_page_size", String(n)); }catch(e){}
+  renderJobs();
+}
+
+function initJobSize(){
+  var sel = document.getElementById("jobsize");
+  if(sel) sel.value = String(jobPageSize);
+}
+
+function renderJobs(){
+  var body = document.getElementById("jobbody");
+  if(!body) return;
+  var total = jobCache.length;
+  var pages = Math.max(1, Math.ceil(total / jobPageSize));
+  if(jobPageNo > pages - 1) jobPageNo = pages - 1;
+  if(jobPageNo < 0) jobPageNo = 0;
+  if(!total){
+    body.innerHTML = '<tr><td colspan="6" class="empty">暂无任务记录</td></tr>';
+  } else {
+    var html = "", start = jobPageNo * jobPageSize, end = Math.min(start + jobPageSize, total);
+    for(var i = start; i < end; i++){
+      var j = jobCache[i];
+      html += "<tr><td>" + esc(j.time) + "</td><td>" + esc(j.ip) + "</td><td>" + esc(j.host || "--") + "</td><td>" + fmtBytes(j.size) + "</td><td>" + (j.seconds || 0) + "s</td><td class='" + ((j.ok === true) ? "ok" : ((j.ok === false) ? "bad" : "")) + "'>" + esc(j.ok === true ? "成功" : (j.ok === false ? ("失败：" + (j.msg || "")) : "进行中")) + "</td></tr>";
+    }
+    body.innerHTML = html;
+  }
+  var info = document.getElementById("jobpageinfo");
+  if(info) info.innerText = "第 " + (jobPageNo + 1) + " / " + pages + " 页 · 共 " + total + " 条（每页 " + jobPageSize + " 条）";
+  var prev = document.getElementById("jobprev"), next = document.getElementById("jobnext");
+  if(prev) prev.disabled = jobPageNo <= 0;
+  if(next) next.disabled = jobPageNo >= pages - 1;
+}
+
+function jobPage(delta){
+  jobPageNo += delta;
+  renderJobs();
+}
+
 function refresh(){
   fetch("/api/status").then(function(r){return r.json();}).then(function(d){
     setText("s_usb", d.usb_online ? "已连接" : "未连接");
@@ -1297,32 +1747,56 @@ function refresh(){
   }).catch(function(){});
 
   fetch("/api/jobs").then(function(r){return r.json();}).then(function(d){
-    var body=document.getElementById("jobbody");
-    if(!body) return;
-    var list=(d.jobs||[]).slice().reverse();
-    if(!list.length){body.innerHTML='<tr><td colspan="6" class="empty">暂无任务记录</td></tr>';return;}
-    var html="";
-    for(var i=0;i<list.length;i++){
-      var j=list[i];
-      html+="<tr><td>"+esc(j.time)+"</td><td>"+esc(j.ip)+"</td><td>"+esc(j.host||"--")+"</td><td>"+fmtBytes(j.size)+"</td><td>"+(j.seconds||0)+"s</td><td class='"+((j.ok===true)?"ok":((j.ok===false)?"bad":""))+"'>"+esc(j.ok===true?"成功":(j.ok===false?("失败："+(j.msg||"")):"进行中"))+"</td></tr>";
-    }
-    body.innerHTML=html;
+    jobCache = (d.jobs || []).slice().reverse();
+    renderJobs();
   }).catch(function(){});
 
-  fetch("/api/log").then(function(r){return r.text();}).then(function(txt){
-    var box=document.getElementById("logbox");
-    if(box){
+  loadLog();
+  loadStats();
+}
+
+var logFrom = 0, logLoaded = false;
+
+function loadLog(){
+  if(document.hidden) return;   // 页面在后台时不拉日志，回到前台会立刻补一次
+  var box = document.getElementById("logbox");
+  fetch("/api/log?since=" + logFrom, {cache:"no-store"}).then(function(r){
+    var total = parseInt(r.headers.get("X-Log-Total") || "0", 10);
+    if(isNaN(total)) total = 0;
+    return r.text().then(function(txt){ return {txt: txt, total: total}; });
+  }).then(function(res){
+    if(!box) return;
+    if(res.total < logFrom){          // 服务重启过，日志重新从第 0 行开始
+      logFrom = 0; logLoaded = false; box.innerText = "";
+      return loadLog();
+    }
+    var txt = (res.txt || "").replace(/\\n+$/, "");
+    var newLines = txt ? txt.split("\\n") : [];
+    if(!logLoaded){
+      box.innerText = newLines.length ? newLines.join("\\n") : "暂无日志";
+      logLoaded = true;
+      box.scrollTop = box.scrollHeight;
+    } else if(newLines.length){
       var stick = box.scrollTop + box.clientHeight + 40 >= box.scrollHeight;
-      box.innerText = txt || "暂无日志";
+      var base = box.innerText === "暂无日志" ? "" : box.innerText;
+      box.innerText = base ? base + "\\n" + newLines.join("\\n") : newLines.join("\\n");
       if(stick) box.scrollTop = box.scrollHeight;
     }
+    logFrom = res.total;
+    setText("loghint", "共 " + res.total + " 行 · 已存档到 data/panel.log");
   }).catch(function(){});
-
-  loadStats();
 }
 
 function reconnect(){
   fetch("/api/reconnect",{method:"POST"}).then(function(){refresh();});
+}
+
+function restartPanel(){
+  if(!confirm("确定重启打印服务？约 2~3 秒内面板无法访问，正在打印的任务会中断。")) return;
+  fetch("/api/restart",{method:"POST"}).then(function(){
+    setText("pilltext", "正在重启…");
+    setTimeout(function(){ location.reload(); }, 4000);
+  }).catch(function(){ setTimeout(function(){ location.reload(); }, 3000); });
 }
 
 function testpage(){
@@ -1345,6 +1819,13 @@ function toggleAuto(){
 function startTimer(){stopTimer();timer=setInterval(refresh,3000);}
 function stopTimer(){if(timer){clearInterval(timer);timer=null;}}
 
+// 日志单独按 2 秒轮询，跟“自动刷新”开关无关，日志永远实时
+setInterval(loadLog, 2000);
+document.addEventListener("visibilitychange", function(){ if(!document.hidden) loadLog(); });
+// 页面从后台回到前台时补一次状态
+document.addEventListener("visibilitychange", function(){ if(!document.hidden && autoRefresh) refresh(); });
+
+initJobSize();
 refresh();
 loadStats(true);
 startTimer();
@@ -1674,6 +2155,15 @@ app.config["SESSION_COOKIE_NAME"] = "p910panel"
 app.permanent_session_lifetime = datetime.timedelta(hours=SESSION_HOURS)
 
 
+@app.after_request
+def no_cache_api(resp):
+    """所有 /api 响应都不允许缓存，否则轮询会读到旧数据（日志尤其明显）"""
+    if request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+    return resp
+
+
 def login_page(err=""):
     block = ('<div class="err">%s</div>' % err) if err else ""
     return (LOGIN_HTML.replace("%STYLE%", AUTH_STYLE + AUTH_FOOTER_CSS)
@@ -1918,6 +2408,13 @@ def api_status():
     with jobs_lock:
         source_count = len(set([j.get("ip") for j in jobs if j.get("ip")]))
     data["source_count"] = source_count
+    # 以真实端点状态为准：拔掉打印机会立刻反映为未连接，避免 state 残留导致面板一直显示已连接
+    if not printer.is_ready():
+        data["usb_online"] = False
+        data["printer_name"] = ""
+        data["usb_bus"] = ""
+        data["usb_addr"] = ""
+        data["usb_speed"] = ""
     data["uptime"] = uptime_str()
     data["uptime_sec"] = round(time.time() - START_TS, 1)
     data["pyusb_ok"] = PYUSB_OK
@@ -1936,8 +2433,32 @@ def api_status():
 
 @app.route("/api/log")
 def api_log():
+    """返回日志。支持 ?since=N：只取第 N 行之后的新日志，前端据此增量追加。
+
+    日志在进程内不做截断，只有容器重启才会清空。
+    """
+    try:
+        since = int(request.args.get("since") or 0)
+    except Exception:
+        since = 0
     with lock:
-        return Response("\n".join(logs) + "\n", mimetype="text/plain")
+        total = len(logs)
+        if 0 <= since < total:
+            lines = logs[since:]
+        elif since >= total:
+            lines = []
+        else:
+            lines = logs[:]
+    body = "\n".join(lines)
+    if body:
+        body += "\n"
+    resp = Response(body, mimetype="text/plain")
+    resp.headers["X-Log-Total"] = str(total)
+    resp.headers["X-Log-From"] = str(since)
+    # 不加 no-store，浏览器会拿缓存里的旧日志，看起来就像“日志不刷新”
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 @app.route("/api/jobs")
@@ -2121,7 +2642,20 @@ def api_reconnect():
     log("收到手动重连指令")
     printer.disconnect()
     ok = printer.connect()
+    if not ok:
+        # 连不上时把现场信息打出来，便于判断是设备节点、权限还是控制传输的问题
+        for line in printer.diag():
+            log("USB 诊断：" + line)
     return jsonify({"ok": ok})
+
+
+@app.route("/api/restart", methods=["POST"])
+def api_restart():
+    log("收到手动重启指令，进程将在 1 秒后重启")
+    timer = threading.Timer(1.0, lambda: restart_self(force=True))
+    timer.daemon = True
+    timer.start()
+    return jsonify({"ok": True, "msg": "服务正在重启，约 2~3 秒后恢复"})
 
 
 @app.route("/api/test", methods=["POST"])
@@ -2174,7 +2708,10 @@ def api_push_test():
 if __name__ == "__main__":
     load_jobs()
     load_stats()
+    _hist = load_log_history()
     log("========== USB 打印机共享面板启动 ==========")
+    if _hist:
+        log("（进程重启过，已从 data/panel.log 载入上次运行的 %d 行日志）" % _hist)
     log("配置文件：%s" % CONFIG_PATH)
     log("目标设备 ID：%s（可在网页「设备设置」里修改）" % PRINTER_ID)
     if PYUSB_OK:
