@@ -43,7 +43,7 @@ DEFAULT_DEVICE_ID = "0482:0d44"
 PRINTER_ID = DEFAULT_DEVICE_ID
 PRINT_PORT = 9100
 WEB_PORT = 8910
-USB_TIMEOUT_MS = 10000
+USB_TIMEOUT_MS = 5000
 CHUNK_SIZE = 4096
 JOB_KEEP = 100
 
@@ -903,6 +903,44 @@ class UsbPrinter(object):
         self.disconnect()
         return self.connect()
 
+    @staticmethod
+    def _is_timeout(exc):
+        txt = str(exc).lower()
+        return ("timed out" in txt) or ("timeout" in txt) or ("errno 110" in txt)
+
+    def _fail_write(self, exc):
+        """写入彻底失败时释放句柄并落回离线，交给守护线程重新连一遍。
+
+        超时（Errno 110）几乎都是打印机侧没取数据（休眠 / 缺纸 / 卡纸 / 盖板未关 /
+        拔插后没恢复），继续拿着同一个句柄重试只会反复超时。
+        """
+        timeout = self._is_timeout(exc)
+        try:
+            self._close()
+        except Exception:
+            pass
+        if timeout:
+            set_state(
+                usb_online=False,
+                printer_name="",
+                usb_bus="",
+                usb_addr="",
+                usb_speed="",
+                last_error="写入超时（Errno 110）：打印机休眠 / 缺纸 / 卡纸 / 盖板未关",
+            )
+            log("USB 写入超时（Errno 110）：15 秒内一个字节都没送出去，"
+                "常见原因是打印机休眠、缺纸、卡纸、盖板未关，或拔插后设备没恢复；已释放句柄，等待自动重连")
+        else:
+            set_state(
+                usb_online=False,
+                printer_name="",
+                usb_bus="",
+                usb_addr="",
+                usb_speed="",
+                last_error=str(exc),
+            )
+            log("USB 写入失败：%s；已释放句柄，等待自动重连" % exc)
+
     def write(self, data):
         with self.io_lock:
             if self.ep_out is None:
@@ -923,7 +961,12 @@ class UsbPrinter(object):
                     except Exception as exc:
                         retry += 1
                         if retry >= 3:
+                            self._fail_write(exc)
                             raise RuntimeError("写入 USB 失败：%s" % exc)
+                        if self._is_timeout(exc) and retry == 1:
+                            log("USB 写入超时（第 1 次）：等待打印机取数据后重试")
+                            time.sleep(1.0)
+                            continue
                         time.sleep(0.2)
                 offset += written if written else len(buf)
 
@@ -1077,6 +1120,9 @@ def handle_job(conn, addr):
     total = 0
     ok = True
     try:
+        # 设备已从系统里消失时立刻失败，别让客户端干等十几秒的 USB 超时
+        if printer.sysfs_present() is False:
+            raise RuntimeError("打印机已拔出（USB 设备不在系统中）")
         if not printer.is_ready():
             if not printer.connect(silent=True):
                 raise RuntimeError("打印机未就绪")
