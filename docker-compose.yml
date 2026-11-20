@@ -4,9 +4,15 @@ services:
     image: p910nd-panel:latest
     container_name: p910nd-panel
     restart: unless-stopped
+    # 给 NAS 的网页终端留一个可交互的 TTY（部分 NAS 的“终端”按钮依赖这两行）
+    stdin_open: true
+    tty: true
     privileged: true
     ports:
+      # 打印端口：局域网客户端按 IP:9100 添加，走本地网络，不经过 Cloudflare
       - "9100:9100"
+      # 面板端口：局域网可访问，同时也给 Cloudflare Tunnel 用
+      # （隧道只配置了 8910 这一个 hostname，9100 不在隧道里）
       - "8910:8910"
     devices:
       - /dev/bus/usb:/dev/bus/usb
@@ -29,6 +35,8 @@ services:
       - PUSH_ENABLE=1
       - OFFLINE_ALERT_SEC=60
       - JOB_FAIL_PUSH=1
+      # 打印监控保留多少条任务记录（默认 1000，最小 100）
+      - JOB_KEEP=1000
     logging:
       driver: json-file
       options:

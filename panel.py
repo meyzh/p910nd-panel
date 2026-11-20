@@ -7,7 +7,7 @@
     8910 —— Web 面板
 
 配置文件：/app/data/config.json（首次启动自动生成，网页里可改）
-任务记录：/app/data/jobs.json（最近 100 条，重启不丢）
+任务记录：/app/data/jobs.json（最近 1000 条，重启不丢）
 
 不依赖内核 usbprinter / usblp，适配裁剪内核的 NAS。
 """
@@ -45,7 +45,9 @@ PRINT_PORT = 9100
 WEB_PORT = 8910
 USB_TIMEOUT_MS = 5000
 CHUNK_SIZE = 4096
-JOB_KEEP = 100
+JOB_KEEP_MIN = 100
+JOB_KEEP_MAX = 5000
+JOB_KEEP = max(JOB_KEEP_MIN, min(JOB_KEEP_MAX, int(os.environ.get("JOB_KEEP", "1000") or 1000)))   # 打印监控保留条数，可用环境变量或网页设置调整
 
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
@@ -83,6 +85,7 @@ logs = []          # 进程内全量保留：只要容器没重启，日志一�
 lock = threading.RLock()
 cfg_lock = threading.RLock()
 jobs_lock = threading.RLock()
+job_lock = threading.Lock()   # 同一时刻只允许一个任务占用 USB：两个任务交替写会把数据流搅乱
 jobs = collections.deque(maxlen=JOB_KEEP)
 
 state = {
@@ -231,6 +234,8 @@ def build_default_config():
             "offline_alert_sec": int(os.environ.get("OFFLINE_ALERT_SEC", "60") or 60),
             "job_fail_push": os.environ.get("JOB_FAIL_PUSH", "1").strip().lower() not in ("0", "false", "no", "off"),
         },
+        "notes": {},      # 来源备注：{"192.168.77.161": "三楼打印室"}
+        "jobs_keep": 0,   # 打印监控保留条数，0 = 跟随环境变量 JOB_KEEP
     }
 
 
@@ -277,6 +282,12 @@ def load_config():
     for key, val in default["push"].items():
         if key not in cfg["push"]:
             cfg["push"][key] = val
+    if not isinstance(cfg.get("notes"), dict):
+        cfg["notes"] = {}
+    try:
+        cfg["jobs_keep"] = int(cfg.get("jobs_keep") or 0)
+    except Exception:
+        cfg["jobs_keep"] = 0
     return cfg
 
 
@@ -296,6 +307,45 @@ def save_config(cfg=None):
 
 
 CFG = load_config()
+
+
+def cfg_job_keep():
+    """配置里的保留条数；0 表示沿用环境变量 JOB_KEEP"""
+    try:
+        n = int(CFG.get("jobs_keep") or 0)
+    except Exception:
+        n = 0
+    if n <= 0:
+        return JOB_KEEP
+    return max(JOB_KEEP_MIN, min(JOB_KEEP_MAX, n))
+
+
+def apply_job_keep(n, persist=False):
+    """调整打印监控的保留条数：重建 deque，超出部分立刻丢弃最老的记录"""
+    global JOB_KEEP, jobs
+    try:
+        n = int(n)
+    except Exception:
+        n = JOB_KEEP
+    n = max(JOB_KEEP_MIN, min(JOB_KEEP_MAX, n))
+    with jobs_lock:
+        current = list(jobs)
+        JOB_KEEP = n
+        jobs = collections.deque(current[-n:], maxlen=n)
+        trimmed = len(current) - len(jobs)
+    if persist:
+        with cfg_lock:
+            CFG["jobs_keep"] = n
+        save_config()
+    if trimmed > 0:
+        save_jobs()
+        log("打印监控保留条数改为 %d 条，已裁掉最早的 %d 条记录" % (n, trimmed))
+    elif persist:
+        log("打印监控保留条数改为 %d 条" % n)
+    return JOB_KEEP
+
+
+apply_job_keep(cfg_job_keep())
 
 HEX_CHARS = "0123456789abcdef"
 
@@ -345,6 +395,16 @@ def push_conf():
 def auth_conf():
     with cfg_lock:
         return dict(CFG.get("auth", {}))
+
+
+def notes_conf():
+    with cfg_lock:
+        return dict(CFG.get("notes", {}) or {})
+
+
+def note_for(ip):
+    """来源机器的备注（没设过返回空串）"""
+    return notes_conf().get(ip, "")
 
 
 def auth_ready():
@@ -974,6 +1034,45 @@ class UsbPrinter(object):
 printer = UsbPrinter()
 
 
+# ==================== 累计任务 / 累计数据（跨重启保留） ====================
+
+TOTALS_PATH = os.path.join(DATA_DIR, "totals.json")
+totals_lock = threading.RLock()
+totals_meta = {"since": ""}
+
+
+def load_totals():
+    """把上次运行的累计任务数与累计流量读回来"""
+    try:
+        with open(TOTALS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    with lock:
+        state["jobs"] = int(data.get("jobs", 0) or 0)
+        state["bytes"] = int(data.get("bytes", 0) or 0)
+    totals_meta["since"] = str(data.get("since", "") or "")
+
+
+def save_totals():
+    try:
+        with lock:
+            jobs_n = int(state["jobs"])
+            bytes_n = int(state["bytes"])
+        if not totals_meta.get("since"):
+            totals_meta["since"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if not os.path.isdir(DATA_DIR):
+            os.makedirs(DATA_DIR)
+        tmp = TOTALS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"jobs": jobs_n, "bytes": bytes_n, "since": totals_meta["since"]}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, TOTALS_PATH)
+    except Exception as exc:
+        print("[WARN] 累计统计保存失败：%s" % exc, flush=True)
+
+
 # ==================== 打印任务记录 ====================
 
 def load_jobs():
@@ -1043,7 +1142,8 @@ def save_stats():
         print("[WARN] 统计文件保存失败：%s" % exc, flush=True)
 
 
-def bump_daily(ok, size):
+def bump_daily(ok, size, ip="", host=""):
+    """累计当天统计，并按来源机器（IP）分别计数。"""
     key = time.strftime("%Y-%m-%d")
     with stats_lock:
         item = daily_stats.setdefault(key, {"ok": 0, "fail": 0, "bytes": 0})
@@ -1052,6 +1152,21 @@ def bump_daily(ok, size):
             item["bytes"] = int(item.get("bytes", 0)) + int(size or 0)
         else:
             item["fail"] = int(item.get("fail", 0)) + 1
+        if ip:
+            src = item.setdefault("src", {})
+            rec = src.get(ip)
+            if not isinstance(rec, dict):
+                rec = {"n": 0, "ok": 0, "fail": 0, "bytes": 0, "host": ""}
+                src[ip] = rec
+            rec["n"] = int(rec.get("n", 0)) + 1
+            if ok:
+                rec["ok"] = int(rec.get("ok", 0)) + 1
+                rec["bytes"] = int(rec.get("bytes", 0)) + int(size or 0)
+            else:
+                rec["fail"] = int(rec.get("fail", 0)) + 1
+            cur_host = host or host_cache.get(ip, "")
+            if cur_host:
+                rec["host"] = cur_host
     save_stats()
 
 
@@ -1106,7 +1221,7 @@ def handle_job(conn, addr):
         "host": host_cache.get(ip, ""),
         "size": 0,
         "seconds": 0,
-        "ok": False,
+        "ok": None,      # None = 进行中；结束时才写 True / False
         "msg": "",
     }
     with jobs_lock:
@@ -1119,6 +1234,9 @@ def handle_job(conn, addr):
 
     total = 0
     ok = True
+    if job_lock.locked():
+        log("USB 正在打印上一个任务，%s 排队等待" % peer)
+    job_lock.acquire()
     try:
         # 设备已从系统里消失时立刻失败，别让客户端干等十几秒的 USB 超时
         if printer.sysfs_present() is False:
@@ -1147,17 +1265,19 @@ def handle_job(conn, addr):
             usb_speed="",
             last_error=str(exc),
         )
-        record["msg"] = str(exc)
-        log("打印任务失败（来源 %s）：%s" % (ip, exc))
-        notify_job_fail(peer, str(exc), total)
+        record["msg"] = str(exc) or exc.__class__.__name__
+        log("打印任务失败（来源 %s）：%s" % (ip, record["msg"]))
+        notify_job_fail(peer, record["msg"], total)
     finally:
+        job_lock.release()
+        time.sleep(0.5)      # 给打印机一点消化缓冲的时间，避免下一个任务立刻撞上 110
         try:
             conn.close()
         except Exception:
             pass
         with lock:
             state["active_clients"] -= 1
-            if ok:
+            if ok and total:
                 state["jobs"] += 1
                 state["bytes"] += total
                 state["last_job_size"] = total
@@ -1166,11 +1286,17 @@ def handle_job(conn, addr):
         record["size"] = total
         record["seconds"] = round(time.time() - started, 2)
         record["ok"] = ok
-        if ok:
+        if ok and total == 0:
+            record["msg"] = "空任务（客户端没有发送数据）"
+        elif ok:
             record["msg"] = "成功"
         save_jobs()
-        bump_daily(ok, total)
-        log("打印任务结束：来源 %s，数据 %d 字节，结果 %s" % (ip, total, "成功" if ok else "失败"))
+        save_totals()
+        if ok and total == 0:
+            log("打印任务结束：来源 %s，客户端未发送任何数据，按空任务忽略" % ip)
+        else:
+            bump_daily(ok, total, ip=ip, host=record.get("host", ""))
+            log("打印任务结束：来源 %s，数据 %d 字节，结果 %s" % (ip, total, "成功" if ok else "失败"))
 
 
 def print_server_loop():
@@ -1339,14 +1465,17 @@ button:active{transform:scale(.98)}
 
 # ==================== 页脚版权 ====================
 
-FOOTER_HTML = (
-    '<div class="foot">Copyright © 2026 '
-    '<a href="https://www.godr.cn/" target="_blank" rel="noopener">亦桉</a>'
-    ' · www.godr.cn All rights reserved.'
-    '<div class="foot2">未经许可禁止商业用途，二次开发须保留本版权信息'
-    ' · <a href="/license">查看许可</a></div>'
-    '</div>'
-)
+def footer_html(with_license=True):
+    """页脚版权：年份按当前时间自动取，不用每年手改。"""
+    lic = ' · <a href="/license">查看许可</a>' if with_license else ""
+    return (
+        '<div class="foot">Copyright © ' + time.strftime("%Y") +
+        ' <a href="https://www.godr.cn/" target="_blank" rel="noopener">亦桉</a>'
+        ' · www.godr.cn All rights reserved.'
+        '<div class="foot2">未经许可禁止商业用途，二次开发须保留本版权信息'
+        + lic + '</div>'
+        '</div>'
+    )
 
 FOOTER_CSS = (
     '.foot{text-align:center;font-size:12px;color:var(--sub);margin:16px 0 4px;line-height:1.8}'
@@ -1527,6 +1656,24 @@ h3 .hint{font-size:12px;color:var(--sub);font-weight:400}
 .bar.ok{background:#12a150}
 .bar.fail{background:#e5484d}
 .dt{font-size:10.5px;color:var(--sub);margin-top:6px;white-space:nowrap;flex:none}
+.col{cursor:pointer;border-radius:6px}
+.col:hover{background:#f1f6fd}
+.col.on{background:#eaf2fb}
+.col.on .dt{color:var(--brand);font-weight:600}
+.daydetail{margin-top:12px;border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:#fbfcfd;font-size:13px}
+.ddhead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.ddhead b{font-size:13.5px}
+.ddsum{font-size:12.5px;color:var(--sub)}
+.ddsum em{font-style:normal;color:var(--brand);font-weight:600}
+.ddclose{border:none;background:none;color:var(--sub);font-size:12px;cursor:pointer;padding:2px 6px}
+.ddlist{display:flex;flex-direction:column;gap:6px}
+.ddrow{display:flex;align-items:center;gap:10px;padding:7px 10px;background:#fff;border:1px solid var(--line);border-radius:9px;font-size:12.5px}
+.ddrow .ip{font-weight:600;color:var(--txt)}
+.ddrow .hn{color:var(--sub);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ddrow .cnt{color:var(--brand);font-weight:600;white-space:nowrap}
+.ddrow .fl{color:#e5484d;font-weight:600;white-space:nowrap}
+.ddrow .bt{color:var(--sub);white-space:nowrap}
+.ddempty{color:var(--sub);font-size:12.5px;padding:4px 0}
 table{width:100%;border-collapse:collapse;font-size:13px;min-width:620px}
 th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
 th{background:#f8fafc;color:var(--sub);font-weight:600}
@@ -1604,17 +1751,17 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
         <option value="14" selected>近 14 天</option>
         <option value="30">近 30 天</option>
       </select>
-      <button class="b4" onclick="clearJobs()">清除记录</button>
     </div>
     <div class="legend">
       <span class="lg"><span class="sw ok"></span>成功任务</span>
       <span class="lg"><span class="sw fail"></span>失败任务</span>
     </div>
     <div class="chart" id="chart"><div class="empty">加载中...</div></div>
+    <div class="daydetail" id="daydetail" style="display:none"></div>
   </div>
 
   <div class="card mt">
-    <h3>打印监控 <span class="hint" id="jobhint">最近 100 条任务，含来源机器</span></h3>
+    <h3>打印监控 <span class="hint" id="jobhint">最近 %JOB_KEEP% 条任务，含来源机器</span></h3>
     <div class="tblwrap">
       <table>
         <thead><tr><th>时间</th><th>来源 IP</th><th>来源主机</th><th>数据量</th><th>耗时</th><th>结果</th></tr></thead>
@@ -1675,6 +1822,56 @@ function tickUptime(){
 function startUptimeTimer(){ if(!upTimer) upTimer = setInterval(tickUptime,1000); }
 
 var lastStatsAt = 0;
+var daySel = "";
+var noteMap = {};
+
+function loadNotes(){
+  fetch("/api/notes", {cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
+    if(!d || !d.ok) return;
+    var old = JSON.stringify(noteMap);
+    noteMap = d.notes || {};
+    if(JSON.stringify(noteMap) !== old){
+      renderJobs();
+      if(daySel) showDay(daySel);
+    }
+  }).catch(function(){});
+}
+
+function showDay(date){
+  daySel = date;
+  var cols = document.querySelectorAll("#chart .col");
+  for(var i=0;i<cols.length;i++){
+    cols[i].className = "col" + (cols[i].getAttribute("data-date") === date ? " on" : "");
+  }
+  var box = document.getElementById("daydetail");
+  if(!box) return;
+  box.style.display = "block";
+  box.innerHTML = '<div class="ddempty">加载中…</div>';
+  fetch("/api/day?date=" + encodeURIComponent(date), {cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){ box.innerHTML = '<div class="ddempty">' + esc(d.msg || "读取失败") + '</div>'; return; }
+    var rows = (d.sources || []).map(function(s){
+      return '<div class="ddrow"><span class="ip">' + esc(s.ip) + '</span>'
+           + '<span class="hn">' + esc(noteMap[s.ip] || s.host || "—") + '</span>'
+           + '<span class="cnt">' + s.n + ' 次</span>'
+           + (s.fail ? '<span class="fl">失败 ' + s.fail + '</span>' : '')
+           + '<span class="bt">' + fmtBytes(s.bytes) + '</span></div>';
+    }).join("");
+    box.innerHTML = '<div class="ddhead"><b>' + esc(d.date) + ' 打印明细</b>'
+      + '<span class="ddsum">总计 <em>' + d.total + '</em> 次 · 成功 ' + d.ok + ' · '
+      + (d.fail ? '<span class="fl">失败 ' + d.fail + '</span>' : '失败 0') + ' · 数据 ' + fmtBytes(d.bytes) + '</span>'
+      + '<button class="ddclose" onclick="closeDay()">收起</button></div>'
+      + '<div class="ddlist">' + (rows || '<div class="ddempty">当天没有来源记录</div>') + '</div>'
+      + (d.fallback ? '<div class="ddempty" style="margin-top:8px">来源分布由最近 %JOB_KEEP% 条任务记录推算（分来源统计从本版本开始累计）</div>' : "");
+  }).catch(function(){ box.innerHTML = '<div class="ddempty">读取失败</div>'; });
+}
+
+function closeDay(){
+  daySel = "";
+  var box = document.getElementById("daydetail");
+  if(box){ box.style.display = "none"; box.innerHTML = ""; }
+  var cols = document.querySelectorAll("#chart .col");
+  for(var i=0;i<cols.length;i++) cols[i].className = "col";
+}
 
 function loadStats(force){
   var now = Date.now();
@@ -1690,26 +1887,30 @@ function loadStats(force){
       var hOk = Math.round(ok / max * 130), hFail = Math.round(fail / max * 130);
       if(ok > 0 && hOk < 3) hOk = 3;
       if(fail > 0 && hFail < 3) hFail = 3;
-      html += '<div class="col" title="' + it.date_full + ' ｜成功 ' + ok + ' ｜失败 ' + fail + ' ｜数据 ' + fmtBytes(it.bytes) + '">'
+      html += '<div class="col' + (it.date_full === daySel ? " on" : "") + '" data-date="' + it.date_full + '" title="' + it.date_full + ' ｜成功 ' + ok + ' ｜失败 ' + fail + ' ｜数据 ' + fmtBytes(it.bytes) + '">'
             + '<div class="bars">'
             + (ok ? '<div class="bar ok" style="height:' + hOk + 'px"></div>' : '')
             + (fail ? '<div class="bar fail" style="height:' + hFail + 'px"></div>' : '')
             + '</div><div class="dt">' + it.date + '</div></div>';
     }
     var box = document.getElementById("chart");
-    if(box) box.innerHTML = html || '<div class="empty">暂无打印数据</div>';
+    if(box){
+      box.innerHTML = html || '<div class="empty">暂无打印数据</div>';
+      if(!box.__dayBound){
+        box.__dayBound = true;
+        box.addEventListener("click", function(e){
+          var el = e.target;
+          while(el && el !== box && !(el.className && String(el.className).indexOf("col") === 0)) el = el.parentNode;
+          if(el && el !== box){
+            var ds = el.getAttribute("data-date");
+            if(ds) showDay(ds);
+          }
+        });
+      }
+    }
     var t = d.today || {};
     setText("statHint", "今日：成功 " + (t.ok || 0) + " · 失败 " + (t.fail || 0) + " · 数据 " + fmtBytes(t.bytes || 0));
   }).catch(function(){});
-}
-
-function clearJobs(){
-  if(!confirm("确定清除全部打印记录和每日统计吗？此操作不可恢复（不影响账号与推送配置）")) return;
-  fetch("/api/jobs/clear",{method:"POST"}).then(function(r){return r.json();}).then(function(d){
-    alert(d.msg || "已清除");
-    refresh();
-    loadStats(true);
-  });
 }
 
 var JOB_PAGE_SIZES = [10, 20, 30, 50, 100];
@@ -1747,7 +1948,7 @@ function renderJobs(){
     var html = "", start = jobPageNo * jobPageSize, end = Math.min(start + jobPageSize, total);
     for(var i = start; i < end; i++){
       var j = jobCache[i];
-      html += "<tr><td>" + esc(j.time) + "</td><td>" + esc(j.ip) + "</td><td>" + esc(j.host || "--") + "</td><td>" + fmtBytes(j.size) + "</td><td>" + (j.seconds || 0) + "s</td><td class='" + ((j.ok === true) ? "ok" : ((j.ok === false) ? "bad" : "")) + "'>" + esc(j.ok === true ? "成功" : (j.ok === false ? ("失败：" + (j.msg || "")) : "进行中")) + "</td></tr>";
+      html += "<tr><td>" + esc(j.time) + "</td><td>" + esc(j.ip) + "</td><td>" + esc(noteMap[j.ip] || j.host || "--") + "</td><td>" + fmtBytes(j.size) + "</td><td>" + (j.seconds || 0) + "s</td><td class='" + ((j.ok === true) ? "ok" : ((j.ok === false) ? "bad" : "")) + "'>" + esc(j.ok === true ? "成功" : (j.ok === false ? ("失败：" + (j.msg || "")) : "进行中")) + "</td></tr>";
     }
     body.innerHTML = html;
   }
@@ -1874,6 +2075,8 @@ document.addEventListener("visibilitychange", function(){ if(!document.hidden &&
 initJobSize();
 refresh();
 loadStats(true);
+loadNotes();
+setInterval(loadNotes, 30000);
 startTimer();
 startUptimeTimer();
 </script>
@@ -1933,7 +2136,7 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
 .note{font-size:12px;color:var(--sub);line-height:1.75;background:#f7fafc;border:1px solid var(--line);border-radius:10px;padding:11px 13px;margin-top:18px}
 """
 
-SETTINGS_PATH_ROWS = [("设备设置", "/device"), ("推送配置", "/push"), ("修改密码", "/password")]
+SETTINGS_PATH_ROWS = [("设备设置", "/device"), ("来源备注", "/notes"), ("数据管理", "/data"), ("推送配置", "/push"), ("修改密码", "/password")]
 
 
 def settings_page(title, active, body, script=""):
@@ -1971,7 +2174,7 @@ def settings_page(title, active, body, script=""):
                 .replace("%TITLE%", title)
                 .replace("%BODY%", body)
                 .replace("%SCRIPT%", script)
-                .replace("%FOOTER%", FOOTER_HTML))
+                .replace("%FOOTER%", footer_html()))
 
 
 DEVICE_BODY = """
@@ -2052,9 +2255,142 @@ function save(){
 }
 """
 
+NOTE_MAX_LEN = 30
+
+NOTES_BODY = """
+<div class="desc">给每台打印来源起个好记的名字（比如“三楼打印室”）。打印监控的“来源主机”列和统计图里的当天明细会优先显示备注，一看就知道是哪台机器发的任务。留空表示不设备注。</div>
+<div class="list" id="list"><div class="empty">加载中...</div></div>
+<div class="btns">
+  <button class="btn" onclick="saveNotes()">保存备注</button>
+  <button class="btn ghost" onclick="loadNotes()">重新读取</button>
+</div>
+<div class="msg" id="msg"></div>
+<div class="note">来源 IP 由统计数据和打印记录自动汇总，没打印过的机器不会出现在这里。备注最多 %NOTE_MAX% 个字，只保存在本机 config.json 内，不会外发。</div>
+"""
+
+NOTES_SCRIPT = """
+var LIMIT = %NOTE_MAX%;
+function setMsg(t,ok){
+  var e=document.getElementById("msg");
+  e.innerText=t||"";
+  e.className="msg "+(ok?"ok":"bad");
+}
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"})[c];});}
+function loadNotes(){
+  setMsg("读取中...",true);
+  fetch("/api/notes",{cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){ setMsg(d.msg||"读取失败",false); return; }
+    var items=d.items||[];
+    if(!items.length){
+      document.getElementById("list").innerHTML='<div class="empty">还没有打印记录：先让一台机器打印一次，再回来设置备注</div>';
+      setMsg("暂无可备注的来源",true);
+      return;
+    }
+    var h="";
+    for(var i=0;i<items.length;i++){
+      var it=items[i];
+      h+='<div class="item"><div class="info"><div class="id">'+esc(it.ip)+'</div>'
+       + '<div class="sub">'+(it.host?esc(it.host)+' · ':'')+'累计 '+(it.n||0)+' 次</div></div>'
+       + '<input class="inline" data-ip="'+esc(it.ip)+'" maxlength="'+LIMIT+'" value="'+esc(it.note||"")+'" placeholder="例如：三楼打印室"></div>';
+    }
+    document.getElementById("list").innerHTML=h;
+    setMsg("共 "+items.length+" 个来源",true);
+  }).catch(function(){ setMsg("读取失败",false); });
+}
+function saveNotes(){
+  var notes={}, n=0;
+  Array.prototype.forEach.call(document.querySelectorAll("input[data-ip]"),function(el){
+    var v=el.value.trim();
+    if(v){ notes[el.getAttribute("data-ip")]=v; n++; }
+  });
+  fetch("/api/notes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({notes:notes})})
+    .then(function(r){return r.json();}).then(function(d){
+      setMsg(d.msg||"", d.ok);
+      if(!d.ok) alert(d.msg||"保存失败");
+      else loadNotes();
+    }).catch(function(){ setMsg("保存失败",false); });
+}
+"""
+
+DATA_BODY = """
+<div class="desc">累计任务与累计数据保存在 data/totals.json，容器重建、镜像更新、重启后都会读回来接着累计。每日统计单独存在 data/stats.json，保留最近 180 天。</div>
+<div class="list" id="sum"><div class="empty">加载中...</div></div>
+<div class="sec">
+  <div class="sech">打印监控保留条数 <span class="muted">100 ~ 5000 条，默认 1000</span></div>
+  <div class="row">
+    <input class="inline" id="k_jobs" type="number" min="100" max="5000" step="100" style="flex:0 0 170px;min-width:140px">
+    <button class="btn" onclick="saveKeep()">保存条数</button>
+  </div>
+  <div class="muted" id="kinfo" style="margin-top:10px"></div>
+</div>
+<div class="btns">
+  <button class="btn" onclick="clearTotals()">清零累计任务与数据</button>
+  <button class="btn ghost" onclick="clearAll()">清除打印记录与每日统计</button>
+</div>
+<div class="msg" id="msg"></div>
+<div class="note">「清零」只把面板上的累计任务、累计数据归零，并把起始时间改成当前时间；打印监控记录与每日统计不受影响。「清除打印记录」会连同任务记录、每日统计一起删掉，不可恢复。</div>
+"""
+
+DATA_SCRIPT = """
+function setMsg(t,ok){
+  var e=document.getElementById("msg");
+  e.innerText=t||"";
+  e.className="msg "+(ok?"ok":"bad");
+}
+function fmtBytes(n){
+  if(!n) return "0 B";
+  var u=["B","KB","MB","GB"],i=0,v=n;
+  while(v>=1024 && i<u.length-1){v=v/1024;i++;}
+  return (i===0? v : v.toFixed(1))+" "+u[i];
+}
+function load(){
+  fetch("/api/totals",{cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){ setMsg(d.msg||"读取失败",false); return; }
+    document.getElementById("sum").innerHTML =
+      '<div class="item"><div class="info"><div class="id">累计任务</div>'
+      + '<div class="sub">' + (d.since ? ("自 "+d.since+" 起统计") : "尚无清零记录") + '</div></div>'
+      + '<div class="id">' + (d.jobs||0) + ' 次</div></div>'
+      + '<div class="item"><div class="info"><div class="id">累计数据</div>'
+      + '<div class="sub">只统计成功任务的数据量</div></div>'
+      + '<div class="id">' + fmtBytes(d.bytes||0) + '</div></div>';
+    setMsg("",true);
+    var k = d.keep_jobs || 1000;
+    var box = document.getElementById("k_jobs");
+    if(box) box.value = k;
+    var info = document.getElementById("kinfo");
+    if(info) info.innerText = "当前保留 " + k + " 条 · 已存 " + (d.job_count||0) + " 条 · jobs.json " + fmtBytes(d.jobs_bytes||0)
+      + " · 可设范围 " + (d.keep_min||100) + " ~ " + (d.keep_max||5000);
+  }).catch(function(){ setMsg("读取失败",false); });
+}
+function saveKeep(){
+  var v = parseInt(document.getElementById("k_jobs").value, 10);
+  if(!v || v < 100 || v > 5000){ setMsg("保留条数需在 100 ~ 5000 之间", false); return; }
+  fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({jobs_keep:v})})
+    .then(function(r){return r.json();}).then(function(d){
+      setMsg(d.msg||"", d.ok);
+      if(!d.ok) alert(d.msg||"保存失败");
+      load();
+    }).catch(function(){ setMsg("保存失败",false); });
+}
+function clearTotals(){
+  if(!confirm("确定把累计任务与累计数据清零吗？打印记录和每日统计不受影响")) return;
+  fetch("/api/totals/clear",{method:"POST"}).then(function(r){return r.json();}).then(function(d){
+    setMsg(d.msg||"", d.ok);
+    load();
+  }).catch(function(){ setMsg("清零失败",false); });
+}
+function clearAll(){
+  if(!confirm("确定清除全部打印记录和每日统计吗？此操作不可恢复")) return;
+  fetch("/api/jobs/clear",{method:"POST"}).then(function(r){return r.json();}).then(function(d){
+    setMsg(d.msg||"", d.ok);
+    load();
+  }).catch(function(){ setMsg("清除失败",false); });
+}
+load();
+"""
+
 PUSH_BODY = """
-<div class="desc">保存后立即生效。多个渠道勾选后会走批量接口，一次推送到全部渠道；离线/恢复/任务失败通知都按这里的设置发送。</div>
-<div class="grid">
+<div class="desc">保存后立即生效。多个渠道勾选后会走批量接口，一次推送到全部渠道；离线/恢复/任务失败通知都按这里的设置发送。</div><div class="grid">
   <div class="field"><label>Pushplus Token</label><input id="p_token" placeholder="pushplus 个人中心里的 token"></div>
   <div class="field"><label>发送模板</label>
     <select id="p_template">
@@ -2214,14 +2550,14 @@ def login_page(err=""):
     block = ('<div class="err">%s</div>' % err) if err else ""
     return (LOGIN_HTML.replace("%STYLE%", AUTH_STYLE + AUTH_FOOTER_CSS)
                       .replace("%ERR%", block)
-                      .replace("%FOOTER%", FOOTER_HTML))
+                      .replace("%FOOTER%", footer_html()))
 
 
 def setup_page(err=""):
     block = ('<div class="err">%s</div>' % err) if err else ""
     return (SETUP_HTML.replace("%STYLE%", AUTH_STYLE + AUTH_FOOTER_CSS)
                       .replace("%ERR%", block)
-                      .replace("%FOOTER%", FOOTER_HTML))
+                      .replace("%FOOTER%", footer_html()))
 
 
 def client_ip():
@@ -2318,9 +2654,13 @@ def robots():
 
 @app.route("/license")
 def page_license():
-    text = (LICENSE_TEXT.replace("&", "&amp;")
-                       .replace("<", "&lt;")
-                       .replace(">", "&gt;"))
+    year = time.strftime("%Y")
+    text = LICENSE_TEXT
+    if year != "2026":
+        text = text.replace("Copyright (c) 2026", "Copyright (c) 2026-%s" % year, 1)
+    text = (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
     html = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2357,7 +2697,7 @@ pre{white-space:pre-wrap;word-break:break-word;font-family:inherit;font-size:13p
 </html>
 """
     return Response(html.replace("%TEXT%", text)
-                        .replace("%FOOTER%", FOOTER_HTML.replace(' · <a href="/license">查看许可</a>', '')),
+                        .replace("%FOOTER%", footer_html(with_license=False)),
                     mimetype="text/html")
 
 
@@ -2368,8 +2708,10 @@ def favicon():
 
 @app.route("/")
 def index():
-    return Response(HTML.replace("%FOOTER_CSS%", FOOTER_CSS).replace("%FOOTER%", FOOTER_HTML),
-                    mimetype="text/html")
+    html = (HTML.replace("%FOOTER_CSS%", FOOTER_CSS)
+                .replace("%FOOTER%", footer_html())
+                .replace("%JOB_KEEP%", str(JOB_KEEP)))
+    return Response(html, mimetype="text/html")
 
 
 @app.route("/device")
@@ -2381,6 +2723,111 @@ def page_device():
 @app.route("/push")
 def page_push():
     return Response(settings_page("推送配置", "推送配置", PUSH_BODY, PUSH_SCRIPT), mimetype="text/html")
+
+
+@app.route("/data")
+def page_data():
+    return Response(settings_page("数据管理", "数据管理", DATA_BODY, DATA_SCRIPT), mimetype="text/html")
+
+
+@app.route("/api/totals", methods=["GET"])
+def api_totals():
+    with lock:
+        jobs_n = int(state.get("jobs", 0) or 0)
+        bytes_n = int(state.get("bytes", 0) or 0)
+    with jobs_lock:
+        job_count = len(jobs)
+        keep = JOB_KEEP
+    try:
+        jobs_bytes = os.path.getsize(JOBS_PATH)
+    except Exception:
+        jobs_bytes = 0
+    return jsonify({
+        "ok": True,
+        "jobs": jobs_n,
+        "bytes": bytes_n,
+        "since": totals_meta.get("since", ""),
+        "keep_jobs": keep,
+        "keep_min": JOB_KEEP_MIN,
+        "keep_max": JOB_KEEP_MAX,
+        "job_count": job_count,
+        "jobs_bytes": jobs_bytes,
+    })
+
+
+@app.route("/api/totals/clear", methods=["POST"])
+def api_totals_clear():
+    with lock:
+        state["jobs"] = 0
+        state["bytes"] = 0
+        state["last_job_size"] = 0
+    totals_meta["since"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_totals()
+    log("累计任务与累计数据已清零")
+    return jsonify({"ok": True, "msg": "累计任务与累计数据已清零"})
+
+
+@app.route("/notes")
+def page_notes():
+    body = NOTES_BODY.replace("%NOTE_MAX%", str(NOTE_MAX_LEN))
+    script = NOTES_SCRIPT.replace("%NOTE_MAX%", str(NOTE_MAX_LEN))
+    return Response(settings_page("来源备注", "来源备注", body, script), mimetype="text/html")
+
+
+@app.route("/api/notes", methods=["GET"])
+def api_notes_get():
+    notes = notes_conf()
+    known = {}
+    with stats_lock:
+        snap = dict(daily_stats)
+    for item in snap.values():
+        src = item.get("src") or {}
+        if not isinstance(src, dict):
+            continue
+        for ip, rec in src.items():
+            if not isinstance(rec, dict):
+                continue
+            a = known.setdefault(ip, {"n": 0, "host": ""})
+            a["n"] += int(rec.get("n", 0) or 0)
+            if rec.get("host") and not a["host"]:
+                a["host"] = rec["host"]
+    with jobs_lock:
+        for j in list(jobs):
+            ip = j.get("ip")
+            if not ip:
+                continue
+            a = known.setdefault(ip, {"n": 0, "host": ""})
+            if j.get("host") and not a["host"]:
+                a["host"] = j["host"]
+    for ip in notes.keys():
+        known.setdefault(ip, {"n": 0, "host": ""})
+    items = [{"ip": ip, "note": notes.get(ip, ""), "host": v["host"], "n": v["n"]}
+             for ip, v in known.items()]
+    items.sort(key=lambda x: (-x["n"], x["ip"]))
+    return jsonify({"ok": True, "notes": notes, "items": items, "max_len": NOTE_MAX_LEN})
+
+
+@app.route("/api/notes", methods=["POST"])
+def api_notes_save():
+    data = request.get_json(silent=True) or {}
+    raw = data.get("notes")
+    if not isinstance(raw, dict):
+        return jsonify({"ok": False, "msg": "格式错误：需要 notes 对象"})
+    cleaned = {}
+    for ip, note in raw.items():
+        ip = str(ip or "").strip()
+        note = str(note or "").strip()
+        if not ip:
+            continue
+        if len(note) > NOTE_MAX_LEN:
+            return jsonify({"ok": False, "msg": "备注最多 %d 个字，%s 超长了" % (NOTE_MAX_LEN, ip)})
+        if note:
+            cleaned[ip] = note
+    with cfg_lock:
+        CFG["notes"] = cleaned
+    save_config()
+    log("来源备注已更新，共 %d 条" % len(cleaned))
+    return jsonify({"ok": True, "msg": "已保存 %d 条来源备注" % len(cleaned), "notes": cleaned})
 
 
 @app.route("/password")
@@ -2565,6 +3012,80 @@ def api_stats():
     })
 
 
+@app.route("/api/day")
+def api_day():
+    """某一天的打印明细：总次数 + 各来源机器次数。"""
+    date_txt = (request.args.get("date") or "").strip()
+    try:
+        day = datetime.datetime.strptime(date_txt, "%Y-%m-%d").date()
+    except Exception:
+        return jsonify({"ok": False, "msg": "日期格式应为 YYYY-MM-DD"})
+    key = day.strftime("%Y-%m-%d")
+
+    with stats_lock:
+        item = dict(daily_stats.get(key) or {})
+        src = dict(item.get("src") or {})
+
+    sources = []
+    for ip, rec in src.items():
+        if not isinstance(rec, dict):
+            continue
+        sources.append({
+            "ip": ip,
+            "host": rec.get("host", "") or "",
+            "n": int(rec.get("n", 0) or 0),
+            "ok": int(rec.get("ok", 0) or 0),
+            "fail": int(rec.get("fail", 0) or 0),
+            "bytes": int(rec.get("bytes", 0) or 0),
+        })
+
+    fallback = False
+    if not sources:
+        # 老版本没按来源记账，退回用 jobs.json 里当天的记录统计（适用于最近 100 条）
+        with jobs_lock:
+            snap = [dict(x) for x in jobs]
+        agg = {}
+        for j in snap:
+            if (str(j.get("time") or "")[:10]) != key:
+                continue
+            if j.get("ok") is None:
+                continue          # 进行中 / 未结束的任务不计入
+            ip = j.get("ip") or "?"
+            a = agg.setdefault(ip, {"n": 0, "ok": 0, "fail": 0, "bytes": 0, "host": ""})
+            a["n"] += 1
+            if j.get("ok") is True:
+                a["ok"] += 1
+                a["bytes"] += int(j.get("size", 0) or 0)
+            else:
+                a["fail"] += 1
+            if j.get("host"):
+                a["host"] = j.get("host")
+        for ip, a in agg.items():
+            sources.append({"ip": ip, "host": a["host"], "n": a["n"],
+                            "ok": a["ok"], "fail": a["fail"], "bytes": a["bytes"]})
+        fallback = True
+
+    sources.sort(key=lambda x: (-x["n"], x["ip"]))
+    ok_n = int(item.get("ok", 0) or 0)
+    fail_n = int(item.get("fail", 0) or 0)
+    bytes_n = int(item.get("bytes", 0) or 0)
+    if fallback and not (ok_n or fail_n):
+        ok_n = sum(x["ok"] for x in sources)
+        fail_n = sum(x["fail"] for x in sources)
+        bytes_n = sum(x["bytes"] for x in sources)
+
+    return jsonify({
+        "ok": True,
+        "date": key,
+        "total": ok_n + fail_n,
+        "ok": ok_n,
+        "fail": fail_n,
+        "bytes": bytes_n,
+        "sources": sources,
+        "fallback": fallback,
+    })
+
+
 @app.route("/api/config", methods=["GET"])
 def api_get_config():
     conf = push_conf()
@@ -2612,6 +3133,17 @@ def api_save_config():
             threading.Thread(target=printer.reconnect, daemon=True).start()
         else:
             log("设备 ID 未变化：%s" % PRINTER_ID)
+
+    keep_body = body.get("jobs_keep")
+    if keep_body is not None:
+        try:
+            n = int(keep_body)
+        except Exception:
+            return jsonify({"ok": False, "msg": "保留条数必须是数字"})
+        if n < JOB_KEEP_MIN or n > JOB_KEEP_MAX:
+            return jsonify({"ok": False, "msg": "保留条数需在 %d ~ %d 之间" % (JOB_KEEP_MIN, JOB_KEEP_MAX)})
+        kept = apply_job_keep(n, persist=True)
+        msg_list.append("打印监控保留条数已改为 %d 条" % kept)
 
     if isinstance(body.get("push"), dict):
         p = body["push"]
@@ -2728,6 +3260,7 @@ def api_test():
             state["last_job_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
             state["last_job_size"] = len(content)
             state["last_job_ok"] = True
+        save_totals()
         log("测试页已发送（%d 字节）" % len(content))
         return jsonify({"ok": True})
     except Exception as exc:
@@ -2754,6 +3287,7 @@ def api_push_test():
 if __name__ == "__main__":
     load_jobs()
     load_stats()
+    load_totals()
     _hist = load_log_history()
     log("========== USB 打印机共享面板启动 ==========")
     if _hist:
