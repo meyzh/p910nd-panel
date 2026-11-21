@@ -1,6 +1,6 @@
 # 🖨️ p910nd-panel
 
-![](https://imgdrive.r2.010102.xyz/content_images/2026/11/16/6afb06c418303.png)
+![](https://raw.githubusercontent.com/meyzh/p910nd-panel/refs/heads/main/img.png)
 
 把一台 USB 打印机变成网络打印机的**单容器服务**：内置 **9100 RAW / JetDirect** 打印服务，同时提供 **8910** Web 管理面板。整个程序只有一个 `panel.py`，没有数据库、没有前端构建、没有多余进程。
 
