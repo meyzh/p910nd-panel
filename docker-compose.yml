@@ -8,12 +8,12 @@ services:
     stdin_open: true
     tty: true
     privileged: true
-    ports:
-      # 打印端口：局域网客户端按 IP:9100 添加，走本地网络，不经过 Cloudflare
-      - "9100:9100"
-      # 面板端口：局域网可访问，同时也给 Cloudflare Tunnel 用
-      # （隧道只配置了 8910 这一个 hostname，9100 不在隧道里）
-      - "8910:8910"
+    # 必须用 host 网络：bridge 模式下容器看到的所有来源 IP 都是 docker 网关地址
+    # （172.x），反查不到真实主机名，来源管理就无法按设备归并。
+    # host 模式下容器直接用 NAS 的网络栈，9100 / 8910 本身就在 NAS 上监听，
+    # 所以这里不要再写 ports（写了也会被 Docker 忽略）。
+    # 注意：改之前确认 NAS 上 9100、8910 没被别的服务占用。
+    network_mode: host
     devices:
       - /dev/bus/usb:/dev/bus/usb
     volumes:

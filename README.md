@@ -21,7 +21,7 @@
 - 🩺 **打印机状态回传**：把打印机自己报的 `CODE=` 与 `DISPLAY=` 原文显示在面板，代码后面附中文解释（卡纸 / 缺纸 / 盖板未关 / 碳粉不足等），多编码自动识别（京瓷一类中文面板也不会乱码）
 - 📊 **打印统计**：按天统计成功 / 失败 / 字节数，保留 180 天；可选近 7 / 14 / 30 天，**PC 默认 14 天、手机默认 7 天**，手动切换会记住；图表固定画满所选天数，有数据的那几天居中、前后用带日期的空位补齐；点有柱子的日期看当天明细（总次数、成功/失败、数据量、来源分布）
 - 📝 **打印监控**：时间、来源 IP、来源主机（反查主机名或备注）、数据量、耗时、结果；**默认每页 5 条**，可选 5 / 10 / 20 / 30 / 50 / 100 并记住选择；总保留条数 100 ~ 5000（默认 1000）可在网页改
-- 🏷️ **来源备注**：给来源 IP 起名字（如「三楼打印室」），监控列表与当日明细优先显示备注，最多 30 字
+- 🏷️ **来源管理（紧凑列表）**：给来源 IP 起名字（如「三楼打印室」，最多 30 字），备注为空时默认显示反查到的主机名，同时显示每个来源**最近一次发任务的时间与文件大小**、累计文件数与累计数据量；不需要的来源可用右上角「移除来源」移出列表（历史记录与统计仍保留）；**同一台设备换了 IP（路由器重新分配）只要反查到的主机名不变，就会自动归并到同一条来源，备注与历史数据一起继承**；主机名先问 NetBIOS（`nbtstat -A`，Windows 客户端一定有），再退 DNS 反查，启动时还会给历史上没有主机名的来源补查一次
 - 📜 **运行日志**：面板里增量滚动显示，写入 `data/panel.log`，超过 1 MB 自动压回最近 3000 行，进程重启后自动载回
 - 🧮 **累计任务 / 累计数据**：跨重启、跨镜像更新保留，可在「数据管理」页一键清零
 
@@ -30,7 +30,7 @@
 - 🔐 **首次自设密码**：没有用户名，只有密码；PBKDF2-SHA256 加盐哈希，明文永不落盘
 - 🚫 **暴力破解防护**：同一 IP 连续 5 次失败锁定 60 秒
 - 🍪 **会话 12 小时**，改密后轮换 `secret_key`，其他设备上的登录立即失效
-- ⚙️ **设置中心 `/settings`**：设备设置、来源备注、数据管理、推送配置、修改密码五个入口，分项页顶部五等分导航
+- ⚙️ **设置中心 `/settings`**：设备设置、来源管理、数据管理、推送配置、修改密码五个入口，分项页顶部五等分导航
 - 🔌 **设备设置**：扫描容器内可见的 USB 设备并点选填入，保存后热重连，不用重启容器
 - 🔔 **Pushplus 推送**：11 个渠道（`wechat` `app` `extension` `webhook` `clawbot` `cmcc` `qq` `cp` `mail` `sms` `voice`），覆盖**离线 / 恢复 / 打印失败**三类事件；失败推送 10 分钟内只发一次
 - ❤️ **`/healthz` 免登录健康检查**：不读 USB、不需要登录，供 Docker HEALTHCHECK 使用
@@ -52,9 +52,9 @@ services:
     stdin_open: true      # NAS 网页终端进容器需要
     tty: true
     privileged: true
-    ports:
-      - "9100:9100"       # RAW 打印
-      - "8910:8910"       # Web 面板
+    # 必须 host 网络（bridge 下看不到客户端真实 IP，来源管理无法按设备归并）
+    # host 模式下 9100 / 8910 直接占用 NAS 端口，所以这里不写 ports
+    network_mode: host
     devices:
       - /dev/bus/usb:/dev/bus/usb
     volumes:
@@ -70,6 +70,17 @@ mkdir -p data
 docker compose pull
 docker compose up -d
 ```
+
+### 端口在哪看（host 网络）
+
+`network_mode: host` 下 `docker ps` 的 PORTS 列是空的，这不是没映射，而是不需要映射：容器直接用 NAS 的网络栈。
+
+- **面板**：`http://NAS的IP:8910`
+- **打印**：客户端添加打印机时填 `NAS的IP`、端口 `9100`、协议 `RAW`
+
+不知道 NAS IP 时，三个地方都能查到：`docker compose logs` 启动日志会打印「面板地址 / 打印端口」两行；面板「设置中心」首页有一条「访问地址」；也可以在 NAS 本机 `ip a` 或 `hostname -I` 看。
+
+如果 8910 被飞牛上的其他服务占用，容器会启动失败，改 `environment` 里的 `WEB_PORT`（如 `8911`）即可，面板地址随之变化，9100 不受影响。
 
 ### 方式二：从源码构建
 
@@ -112,7 +123,7 @@ docker restart p910nd-panel
 | `/` | 主页：状态卡、统计图、打印监控、运行日志、操作按钮 |
 | `/settings` | 设置中心，五个入口汇总 |
 | `/device` | 选择 / 扫描 USB 打印机设备 |
-| `/notes` | 来源 IP 备注 |
+| `/notes` | 来源管理：备注、最近一次时间、累计文件数与数据量、删除来源 |
 | `/data` | 保留条数、清零累计、清除记录与统计 |
 | `/push` | Pushplus 令牌、渠道、触发条件、测试推送 |
 | `/password` | 修改访问密码 |
@@ -141,7 +152,7 @@ docker restart p910nd-panel
 
 | 文件 | 内容 |
 | --- | --- |
-| `config.json` | 设备 ID、密码哈希、`secret_key`、推送配置、来源备注、保留条数 |
+| `config.json` | 设备 ID、密码哈希、`secret_key`、推送配置、来源备注与已删除来源、保留条数 |
 | `jobs.json` | 打印任务记录（默认 1000 条，可在网页调整） |
 | `stats.json` | 每日统计，保留 180 天 |
 | `totals.json` | 累计任务数、累计字节数、起始时间 |
@@ -183,7 +194,7 @@ docker compose up -d
 
 页面：`/setup` `/login` `/logout` `/` `/settings` `/device` `/notes` `/data` `/push` `/password` `/license` `/robots.txt`
 
-API：`/healthz` `/api/status` `/api/log` `/api/jobs` `/api/jobs/clear` `/api/stats?days=7|14|30` `/api/day?date=YYYY-MM-DD` `/api/config` `/api/notes` `/api/totals` `/api/totals/clear` `/api/reconnect` `/api/restart` `/api/push_test` `/api/usb/scan`
+API：`/healthz` `/api/status` `/api/log` `/api/jobs` `/api/jobs/clear` `/api/stats?days=7|14|30` `/api/day?date=YYYY-MM-DD` `/api/config` `/api/notes` `/api/notes/delete` `/api/totals` `/api/totals/clear` `/api/reconnect` `/api/restart` `/api/push_test` `/api/usb/scan`
 
 除 `/setup`、`/login`、`/license`、`/robots.txt`、`/healthz` 外均需登录；`/api/*` 全部 `Cache-Control: no-store`，避免轮询读到旧数据。
 
@@ -205,8 +216,8 @@ API：`/healthz` `/api/status` `/api/log` `/api/jobs` `/api/jobs/clear` `/api/st
 
 本项目**仅允许非商业使用**，完整条款见 [LICENSE](LICENSE)。
 
-- 🚫 **禁止商用**：未经作者书面许可，不得将本项目或其核心功能用于销售、付费部署、SaaS 租赁、预装售卖、收费服务等任何商业用途。商业授权请联系 [https://www.godr.cn/](https://www.godr.cn/)。
-- ©️ **版权必须保留**：二次开发、修改、衍生版本在分发或对外提供时，必须完整保留 `LICENSE` 与原作者版权声明，保留网页界面底部的版权信息（`© 亦桉` 及指向 [https://www.godr.cn/](https://www.godr.cn/) 的链接），并在显著位置注明「基于 p910nd-panel 修改」。
+- 🚫 **禁止商用**：未经作者书面许可，不得将本项目或其核心功能用于销售、付费部署、SaaS 租赁、预装售卖、收费服务等任何商业用途。商业授权请通过项目地址 [https://github.com/meyzh/p910nd-panel](https://github.com/meyzh/p910nd-panel) 联系作者。
+- ©️ **版权必须保留**：二次开发、修改、衍生版本在分发或对外提供时，必须完整保留 `LICENSE` 与原作者版权声明，保留网页界面底部的版权信息（`© 亦桉` 及指向 [https://www.godr.cn/](https://www.godr.cn/) 的链接），并在显著位置注明「基于 p910nd-panel（https://github.com/meyzh/p910nd-panel）修改」。
 - 📌 **不得改许可**：衍生作品继续受本许可约束，不能单方面改为 MIT / Apache-2.0 等更宽松的许可。
 - ❌ **不得冒名**：不得以原作者名义宣传，或暗示原作者为衍生作品背书。
 

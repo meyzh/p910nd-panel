@@ -20,6 +20,7 @@ import json
 import os
 import re
 import socket
+import struct
 import sys
 import threading
 import time
@@ -234,7 +235,8 @@ def build_default_config():
             "offline_alert_sec": int(os.environ.get("OFFLINE_ALERT_SEC", "60") or 60),
             "job_fail_push": os.environ.get("JOB_FAIL_PUSH", "1").strip().lower() not in ("0", "false", "no", "off"),
         },
-        "notes": {},      # 来源备注：{"192.168.77.161": "三楼打印室"}
+        "notes": {},      # 来源备注：设备主机名或 IP -> 自定义名字
+        "src_hidden": [],  # 来源管理里删除掉的来源 IP，不再出现在列表
         "jobs_keep": 0,   # 打印监控保留条数，0 = 跟随环境变量 JOB_KEEP
     }
 
@@ -284,6 +286,10 @@ def load_config():
             cfg["push"][key] = val
     if not isinstance(cfg.get("notes"), dict):
         cfg["notes"] = {}
+    if not isinstance(cfg.get("src_hidden"), list):
+        cfg["src_hidden"] = []
+    else:
+        cfg["src_hidden"] = [str(x) for x in cfg["src_hidden"] if str(x).strip()]
     try:
         cfg["jobs_keep"] = int(cfg.get("jobs_keep") or 0)
     except Exception:
@@ -1488,6 +1494,8 @@ def save_jobs():
 
 
 host_cache = {}
+host_cache_ts = {}
+HOST_CACHE_TTL = 1800
 
 
 # ==================== 每日打印统计 ====================
@@ -1553,19 +1561,154 @@ def bump_daily(ok, size, ip="", host=""):
 
 
 
-def resolve_hostname(ip, record):
-    """反查客户端主机名（后台线程，失败留空）"""
-    if ip in host_cache:
-        record["host"] = host_cache[ip]
-        return
-    name = ""
+def nbstat_name(ip, timeout=0.7):
+    """NetBIOS 节点状态查询（等价 nbtstat -A）：Windows 客户端没有 PTR 也能问到主机名"""
+    sock = None
     try:
-        name = socket.gethostbyaddr(ip)[0]
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        tid = int(time.time()) & 0xFFFF
+        pkt = (struct.pack(">HHHHHH", tid, 0x0000, 1, 0, 0, 0)
+               + b"\x20" + b"CK" + b"A" * 30 + b"\x00"
+               + struct.pack(">HH", 0x0021, 0x0001))
+        sock.sendto(pkt, (ip, 137))
+        data, _ = sock.recvfrom(2048)
     except Exception:
-        name = ""
+        return ""
+    finally:
+        if sock is not None:
+            sock.close()
+    try:
+        head = data.find(b"\x00\x21\x00\x01", 12)
+        if head < 0:
+            return ""
+        found = re.search(rb"[A-Za-z0-9][A-Za-z0-9._-]{1,15}", data[head + 11:])
+        return found.group(0).decode("ascii", "ignore") if found else ""
+    except Exception:
+        return ""
+
+
+def ptr_lookup(ip, timeout=2.0):
+    """PTR 反查，带超时（系统 DNS 对不存在的 IP 会卡好几秒）"""
+    box = {}
+
+    def run():
+        try:
+            box["n"] = socket.gethostbyaddr(ip)[0]
+        except Exception:
+            box["n"] = ""
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(timeout)
+    return (box.get("n") or "").strip()
+
+
+def local_ipv4s():
+    """列出本机非回环 IPv4（host 网络下就是 NAS 的真实局域网地址）"""
+    out = []
+    try:
+        import fcntl
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        for _idx, name in socket.if_nameindex():
+            if name == "lo" or name.startswith(("docker", "br-", "veth", "virbr")):
+                continue
+            try:
+                req = struct.pack("256s", name[:15].encode())
+                res = fcntl.ioctl(s.fileno(), 0x8915, req)   # SIOCGIFADDR
+                ip = socket.inet_ntoa(res[20:24])
+                if ip and not ip.startswith("127."):
+                    out.append(ip)
+            except Exception:
+                continue
+        s.close()
+    except Exception:
+        pass
+    if not out:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(1)
+            s.connect(("8.8.8.8", 53))
+            out.append(s.getsockname()[0])
+            s.close()
+        except Exception:
+            pass
+    return out
+
+
+def primary_lan_ip():
+    ips = local_ipv4s()
+    for ip in ips:
+        if ip.startswith("192.168."):
+            return ip
+    for ip in ips:
+        if ip.startswith("10.") or ip.startswith("172."):
+            return ip
+    return ips[0] if ips else ""
+
+
+def lookup_host(ip):
+    """主机名查询：先问 NetBIOS（Windows 客户端一定有），再退 DNS 反查"""
+    nb = nbstat_name(ip)
+    if nb:
+        return nb
+    name = ptr_lookup(ip)
+    # 只把 IP 拼成 192-168-77-20 这种没意义的名字，当没有
+    if name and not re.match(r"^[\d\-_.]+$", name):
+        return name
+    return ""
+
+
+def resolve_hostname(ip, record):
+    """反查客户端主机名（后台线程，失败留空；空结果 30 分钟后重试）"""
+    cached = host_cache.get(ip, "")
+    cached_at = host_cache_ts.get(ip, 0)
+    if cached or (cached_at and time.time() - cached_at < HOST_CACHE_TTL):
+        record["host"] = cached
+        save_jobs()
+        return
+    name = lookup_host(ip)
     host_cache[ip] = name
+    host_cache_ts[ip] = time.time()
     record["host"] = name
     save_jobs()
+
+
+def backfill_hosts():
+    """启动时给历史上没有主机名的来源补查一次，让跨 IP 归并对旧数据也生效"""
+    ips = set()
+    with jobs_lock:
+        for j in jobs:
+            if j.get("ip") and not j.get("host"):
+                ips.add(j["ip"])
+    with stats_lock:
+        for item in daily_stats.values():
+            for ip, rec in (item.get("src") or {}).items():
+                if isinstance(rec, dict) and not rec.get("host"):
+                    ips.add(ip)
+    changed = False
+    for ip in list(ips)[:30]:
+        if host_cache.get(ip):
+            continue
+        name = lookup_host(ip)
+        host_cache[ip] = name
+        host_cache_ts[ip] = time.time()
+        if not name:
+            continue
+        with jobs_lock:
+            for j in jobs:
+                if j.get("ip") == ip and not j.get("host"):
+                    j["host"] = name
+                    changed = True
+        with stats_lock:
+            for item in daily_stats.values():
+                rec = (item.get("src") or {}).get(ip)
+                if isinstance(rec, dict) and not rec.get("host"):
+                    rec["host"] = name
+                    changed = True
+    if changed:
+        save_jobs()
+        save_stats()
 
 
 # ==================== 打印服务 ====================
@@ -1945,7 +2088,7 @@ All rights reserved. 保留所有权利。
    - 以 SaaS、云打印、按次收费等形式对外提供本项目的功能；
    - 预装或捆绑进对外销售的硬件、整机、系统镜像；
    - 以本项目为主要内容开展培训、课程、付费社群并获利。
-2. 商业授权需单独取得书面许可，联系方式见 https://www.godr.cn/ 。
+2. 商业授权需单独取得书面许可，联系方式见项目地址 https://github.com/meyzh/p910nd-panel 。
 
 三、版权与署名必须保留
 1. 不得移除、隐藏、篡改本项目中的版权声明与作者署名，包括但不限于：
@@ -1953,7 +2096,7 @@ All rights reserved. 保留所有权利。
    https://www.godr.cn/ 的链接）、README 与许可证文件。
 2. 二次开发、修改、衍生版本在分发或以任何形式对外提供时，必须：
    - 完整保留许可证文件与原作者版权声明；
-   - 在显著位置注明「基于 p910nd-panel（https://www.godr.cn/）修改」；
+   - 在显著位置注明「基于 p910nd-panel（https://github.com/meyzh/p910nd-panel）修改」；
    - 保留网页界面底部的原作者版权信息，不得删除或替换为他人署名。
 3. 衍生作品继续受本许可约束，不得单方面改为 MIT、Apache-2.0 等更宽松的
    许可，除非取得版权所有者的书面同意。
@@ -2340,12 +2483,17 @@ function startUptimeTimer(){ if(!upTimer) upTimer = setInterval(tickUptime,1000)
 var lastStatsAt = 0;
 var daySel = "";
 var noteMap = {};
+function noteOf(ip,host){
+  return (ip&&noteMap[ip])||(host&&(noteMap[host]||noteMap[String(host).toLowerCase()]))||host||"—";
+}
 
 function loadNotes(){
   fetch("/api/notes", {cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
     if(!d || !d.ok) return;
     var old = JSON.stringify(noteMap);
     noteMap = d.notes || {};
+    var hn = d.host_notes || {};
+    for(var k in hn){ if(hn[k]) noteMap[k] = hn[k]; }
     if(JSON.stringify(noteMap) !== old){
       renderJobs();
       if(daySel) showDay(daySel);
@@ -2367,7 +2515,7 @@ function showDay(date){
     if(!d.ok){ box.innerHTML = '<div class="ddempty">' + esc(d.msg || "读取失败") + '</div>'; return; }
     var rows = (d.sources || []).map(function(s){
       return '<div class="ddrow"><span class="ip">' + esc(s.ip) + '</span>'
-           + '<span class="hn">' + esc(noteMap[s.ip] || s.host || "—") + '</span>'
+           + '<span class="hn">' + esc(noteOf(s.ip, s.host)) + '</span>'
            + '<span class="cnt">' + s.n + ' 次</span>'
            + (s.fail ? '<span class="fl">失败 ' + s.fail + '</span>' : '')
            + '<span class="bt">' + fmtBytes(s.bytes) + '</span></div>';
@@ -2473,7 +2621,7 @@ function renderJobs(){
     var html = "", start = jobPageNo * jobPageSize, end = Math.min(start + jobPageSize, total);
     for(var i = start; i < end; i++){
       var j = jobCache[i];
-      html += "<tr><td>" + esc(j.time) + "</td><td>" + esc(j.ip) + "</td><td>" + esc(noteMap[j.ip] || j.host || "--") + "</td><td>" + fmtBytes(j.size) + "</td><td>" + (j.seconds || 0) + "s</td><td class='" + ((j.ok === true) ? "ok" : ((j.ok === false) ? "bad" : "")) + "'>" + esc(j.ok === true ? "成功" : (j.ok === false ? ("失败：" + (j.msg || "")) : "进行中")) + "</td></tr>";
+      html += "<tr><td>" + esc(j.time) + "</td><td>" + esc(j.ip) + "</td><td>" + esc(noteOf(j.ip, j.host)) + "</td><td>" + fmtBytes(j.size) + "</td><td>" + (j.seconds || 0) + "s</td><td class='" + ((j.ok === true) ? "ok" : ((j.ok === false) ? "bad" : "")) + "'>" + esc(j.ok === true ? "成功" : (j.ok === false ? ("失败：" + (j.msg || "")) : "进行中")) + "</td></tr>";
     }
     body.innerHTML = html;
   }
@@ -2640,6 +2788,18 @@ h2{font-size:17px;font-weight:600;margin-bottom:6px}
 input,select{width:100%;padding:12px 13px;border:1px solid var(--line);border-radius:10px;font-size:14px;outline:none;background:#fbfcfd;color:var(--txt)}
 input:focus,select:focus{border-color:var(--brand);background:#fff}
 .inline{flex:1 1 220px;min-width:180px}
+.item .inline{flex:1 1 100%;margin-top:10px}
+.srow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.srow .inline{flex:1 1 180px;margin-top:0}
+.srcitem{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px}
+.sinfo{flex:1 1 150px;min-width:130px}
+.sinfo .sub{margin-top:2px;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.snote{flex:0 0 132px;width:132px;padding:7px 9px;border:1px solid var(--line);border-radius:9px;background:#fbfcfd;font-size:12.5px;outline:none;color:var(--txt)}
+.snote:focus{border-color:var(--brand);background:#fff}
+.ldel{flex:none;width:30px;height:30px;padding:0;display:flex;align-items:center;justify-content:center;border:1px solid var(--line);border-radius:9px;background:#fff;color:var(--sub);cursor:pointer}
+.ldel:hover{border-color:var(--bad);color:var(--bad)}
+.ldel svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+@media (max-width:560px){.srcitem{padding:8px 10px;gap:8px}.sinfo{flex:1 1 100%;display:flex;align-items:baseline;gap:8px;min-width:0}.sinfo .id{flex:none;font-size:13px}.sinfo .sub{margin-top:0;flex:1 1 auto;min-width:0}.snote{flex:1 1 auto;width:auto;height:30px;padding:5px 9px}.ldel{width:30px;height:30px}}
 .btn{padding:12px 18px;border:none;border-radius:10px;background:var(--brand);color:#fff;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap}
 .btn.ghost{background:#fff;color:var(--brand);border:1px solid var(--brand)}
 .btn:active{transform:scale(.98)}
@@ -2682,13 +2842,13 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
 @media (max-width:560px){.bar{gap:8px}.nav{gap:6px}.nav a{padding:7px 4px;font-size:11.5px}input,select{font-size:16px}}
 """
 
-SETTINGS_PATH_ROWS = [("设备设置", "/device"), ("来源备注", "/notes"), ("数据管理", "/data"), ("推送配置", "/push"), ("修改密码", "/password")]
+SETTINGS_PATH_ROWS = [("设备设置", "/device"), ("来源管理", "/notes"), ("数据管理", "/data"), ("推送配置", "/push"), ("修改密码", "/password")]
 
-SETTINGS_INDEX_ICON = {"设备设置": "printer", "来源备注": "tag", "数据管理": "chart", "推送配置": "bell", "修改密码": "key"}
+SETTINGS_INDEX_ICON = {"设备设置": "printer", "来源管理": "tag", "数据管理": "chart", "推送配置": "bell", "修改密码": "key"}
 
 SETTINGS_INDEX_DESC = {
     "设备设置": "选择要共享的 USB 打印机设备，保存后立即重连。",
-    "来源备注": "给常用来源 IP 起名字，任务列表里直接显示“办公室”“老板电脑”等。",
+    "来源管理": "查看每个来源的备注、最近一次打印时间与累计数据量，不需要的可直接删除。",
     "数据管理": "调整打印监控保留条数，清理累计任务与累计数据。",
     "推送配置": "配置 Pushplus 推送渠道与触发条件，可发一条测试推送。",
     "修改密码": "更换面板访问密码，改完旧会话会失效。",
@@ -2703,7 +2863,14 @@ def settings_index_body():
                  '<span class="setgo">›</span></a>') % (
                      href, ICONS.get(SETTINGS_INDEX_ICON.get(label, ""), ""), label,
                      SETTINGS_INDEX_DESC.get(label, ""))
-    return '<div class="desc">面板的所有配置都在这里，点进去按需修改。</div><div class="setlist">%s</div>' % rows
+    ip = primary_lan_ip()
+    addr = ""
+    if ip:
+        addr = ('<div class="setrow"><span class="setic">%s</span>'
+                '<span class="setinfo"><b>访问地址</b>'
+                '<span>面板 http://%s:%d ｜ 打印端口 %s:%d</span></span></div>') % (
+                    ICONS.get("printer", ""), ip, WEB_PORT, ip, PRINT_PORT)
+    return '<div class="desc">面板的所有配置都在这里，点进去按需修改。</div><div class="setlist">%s</div>%s' % (rows, addr)
 
 
 def settings_page(title, active, body, script=""):
@@ -2827,50 +2994,90 @@ function save(){
 NOTE_MAX_LEN = 30
 
 NOTES_BODY = """
-<div class="desc">给每台打印来源起个好记的名字（比如“三楼打印室”）。打印监控的“来源主机”列和统计图里的当天明细会优先显示备注，一看就知道是哪台机器发的任务。留空表示不设备注。</div>
+<div class="desc">管理所有打印来源：起个备注名、查看每台机器最近一次发任务的时间和累计数据量，不需要的来源可以直接删掉。打印监控的“来源主机”列与统计图当天明细会优先显示备注。</div>
 <div class="list" id="list"><div class="empty">加载中...</div></div>
 <div class="btns">
   <button class="btn" onclick="saveNotes()">保存备注</button>
   <button class="btn ghost" onclick="loadNotes()">重新读取</button>
 </div>
 <div class="msg" id="msg"></div>
-<div class="note">来源 IP 由统计数据和打印记录自动汇总，没打印过的机器不会出现在这里。备注最多 %NOTE_MAX% 个字，只保存在本机 config.json 内，不会外发。</div>
+<div class="note">来源 IP 由统计数据和打印记录自动汇总，没打印过的机器不会出现在这里。「移除来源」只把来源从本列表移除，历史打印记录与统计仍然保留；清空备注框只是不再显示备注，不会删掉来源。备注最多 %NOTE_MAX% 个字，只保存在本机 config.json 内，不会外发。</div>
 """
 
 NOTES_SCRIPT = """
 var LIMIT = %NOTE_MAX%;
+var TRASH = '<svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>';
 function setMsg(t,ok){
   var e=document.getElementById("msg");
   e.innerText=t||"";
   e.className="msg "+(ok?"ok":"bad");
 }
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"})[c];});}
+function fmtSize(n){
+  n=Number(n||0);
+  if(n<1024) return n+" B";
+  if(n<1048576) return (n/1024).toFixed(1)+" KB";
+  if(n<1073741824) return (n/1048576).toFixed(1)+" MB";
+  return (n/1073741824).toFixed(2)+" GB";
+}
 function loadNotes(){
   setMsg("读取中...",true);
-  fetch("/api/notes",{cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
+  var ac = (typeof AbortController!=="undefined") ? new AbortController() : null;
+  var tid = setTimeout(function(){ if(ac) ac.abort(); }, 12000);
+  var opt = {cache:"no-store"};
+  if(ac) opt.signal = ac.signal;
+  fetch("/api/notes",opt).then(function(r){return r.json();}).then(function(d){
+    clearTimeout(tid);
     if(!d.ok){ setMsg(d.msg||"读取失败",false); return; }
     var items=d.items||[];
     if(!items.length){
-      document.getElementById("list").innerHTML='<div class="empty">还没有打印记录：先让一台机器打印一次，再回来设置备注</div>';
-      setMsg("暂无可备注的来源",true);
+      document.getElementById("list").innerHTML='<div class="empty">还没有打印记录：先让一台机器打印一次，再回来管理来源</div>';
+      setMsg("暂无来源",true);
       return;
     }
     var h="";
     for(var i=0;i<items.length;i++){
       var it=items[i];
-      h+='<div class="item"><div class="info"><div class="id">'+esc(it.ip)+'</div>'
-       + '<div class="sub">'+(it.host?esc(it.host)+' · ':'')+'累计 '+(it.n||0)+' 次</div></div>'
-       + '<input class="inline" data-ip="'+esc(it.ip)+'" maxlength="'+LIMIT+'" value="'+esc(it.note||"")+'" placeholder="例如：三楼打印室"></div>';
+      var sub="最近 "+(it.last?esc(String(it.last).slice(5,16)):"—")
+        +" · "+(it.n||0)+" 个 · "+fmtSize(it.bytes||0);
+      var tip="";
+      if(it.last&&it.last_size!=null) tip="最近一次文件 "+fmtSize(it.last_size);
+      if(it.ips&&it.ips.length>1){
+        sub+=" · "+it.ips.length+" 个 IP";
+        tip+=(tip?"；":"")+"曾用 IP："+it.ips.join("、");
+      }
+      h+='<div class="item srcitem"><div class="sinfo" title="'+esc(tip)+'"><div class="id">'+esc(it.ip)
+       + (it.host?'<span class="tag">'+esc(it.host)+'</span>':'')
+       + '</div><div class="sub">'+sub+'</div></div>'
+       + '<input class="snote" data-key="'+esc(it.key)+'" data-host="'+esc(it.host||"")+'" maxlength="'+LIMIT+'" value="'+esc(it.note || it.host || "")+'" title="备注">'
+       + '<button class="ldel" data-key="'+esc(it.key)+'" title="移除来源" aria-label="移除来源">'+TRASH+'</button></div>';
     }
     document.getElementById("list").innerHTML=h;
+    Array.prototype.forEach.call(document.querySelectorAll("button.ldel"),function(b){
+      b.onclick=function(){ delSrc(this.getAttribute("data-key")); };
+    });
     setMsg("共 "+items.length+" 个来源",true);
-  }).catch(function(){ setMsg("读取失败",false); });
+  }).catch(function(e){
+    clearTimeout(tid);
+    var t=(e&&e.name==="AbortError")?"读取超时，点「重新读取」再试":"读取失败，点「重新读取」再试";
+    setMsg(t,false);
+    var box=document.getElementById("list");
+    if(box&&!box.querySelector("input[data-key]")) box.innerHTML='<div class="empty">'+t+'</div>';
+  });
+}
+function delSrc(key){
+  if(!confirm("「移除来源」会把 "+key+" 从来源列表里去掉，不是清空备注。\\n历史打印记录与统计数据仍会保留，确定继续？")) return;
+  fetch("/api/notes/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:key})})
+    .then(function(r){return r.json();}).then(function(d){
+      setMsg(d.msg||"",d.ok);
+      if(d.ok) loadNotes();
+    }).catch(function(){ setMsg("删除失败",false); });
 }
 function saveNotes(){
   var notes={}, n=0;
-  Array.prototype.forEach.call(document.querySelectorAll("input[data-ip]"),function(el){
+  Array.prototype.forEach.call(document.querySelectorAll("input[data-key]"),function(el){
     var v=el.value.trim();
-    if(v){ notes[el.getAttribute("data-ip")]=v; n++; }
+    if(v && v !== el.getAttribute("data-host")){ notes[el.getAttribute("data-key")]=v; n++; }
   });
   fetch("/api/notes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({notes:notes})})
     .then(function(r){return r.json();}).then(function(d){
@@ -2879,6 +3086,7 @@ function saveNotes(){
       else loadNotes();
     }).catch(function(){ setMsg("保存失败",false); });
 }
+loadNotes();
 """
 
 DATA_BODY = """
@@ -3353,12 +3561,14 @@ def api_totals_clear():
 def page_notes():
     body = NOTES_BODY.replace("%NOTE_MAX%", str(NOTE_MAX_LEN))
     script = NOTES_SCRIPT.replace("%NOTE_MAX%", str(NOTE_MAX_LEN))
-    return Response(settings_page("来源备注", "来源备注", body, script), mimetype="text/html")
+    return Response(settings_page("来源管理", "来源管理", body, script), mimetype="text/html")
 
 
 @app.route("/api/notes", methods=["GET"])
 def api_notes_get():
     notes = notes_conf()
+    with cfg_lock:
+        hidden = set(CFG.get("src_hidden") or [])
     known = {}
     with stats_lock:
         snap = dict(daily_stats)
@@ -3369,24 +3579,88 @@ def api_notes_get():
         for ip, rec in src.items():
             if not isinstance(rec, dict):
                 continue
-            a = known.setdefault(ip, {"n": 0, "host": ""})
+            a = known.setdefault(ip, {"n": 0, "bytes": 0, "host": "", "last": "", "last_size": None})
             a["n"] += int(rec.get("n", 0) or 0)
+            a["bytes"] += int(rec.get("bytes", 0) or 0)
             if rec.get("host") and not a["host"]:
                 a["host"] = rec["host"]
     with jobs_lock:
-        for j in list(jobs):
-            ip = j.get("ip")
-            if not ip:
-                continue
-            a = known.setdefault(ip, {"n": 0, "host": ""})
-            if j.get("host") and not a["host"]:
-                a["host"] = j["host"]
-    for ip in notes.keys():
-        known.setdefault(ip, {"n": 0, "host": ""})
-    items = [{"ip": ip, "note": notes.get(ip, ""), "host": v["host"], "n": v["n"]}
-             for ip, v in known.items()]
-    items.sort(key=lambda x: (-x["n"], x["ip"]))
-    return jsonify({"ok": True, "notes": notes, "items": items, "max_len": NOTE_MAX_LEN})
+        jsnap = list(jobs)
+    for j in jsnap:
+        ip = j.get("ip")
+        if not ip:
+            continue
+        a = known.setdefault(ip, {"n": 0, "bytes": 0, "host": "", "last": "", "last_size": None})
+        a["job_n"] = int(a.get("job_n", 0) or 0) + 1
+        a["job_bytes"] = int(a.get("job_bytes", 0) or 0) + int(j.get("size", 0) or 0)
+        t = j.get("time") or ""
+        if t > a["last"]:
+            a["last"] = t
+            a["last_size"] = int(j.get("size", 0) or 0)
+            a["last_ok"] = j.get("ok")
+        if j.get("host") and not a["host"]:
+            a["host"] = j["host"]
+    for key in notes.keys():
+        if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", str(key)):
+            known.setdefault(key, {"n": 0, "bytes": 0, "host": "", "last": "", "last_size": None})
+    # 按「设备」聚合：有主机名就以主机名为身份，路由器重新分配 IP 后仍归到同一台设备；
+    # 没有主机名（反查失败）只能按 IP 区分
+    groups = {}
+    for ip, v in known.items():
+        host = (v.get("host") or host_cache.get(ip, "") or "").strip()
+        gid = ("h:" + host.lower()) if host else ("i:" + ip)
+        g = groups.get(gid)
+        if not g:
+            g = {"key": host or ip, "host": host, "ips": [], "n": 0, "bytes": 0,
+                 "last": "", "last_size": None, "last_ok": None, "last_ip": ip}
+            groups[gid] = g
+        g["ips"].append(ip)
+        g["n"] += int(v["n"] or v.get("job_n", 0) or 0)
+        g["bytes"] += int(v["bytes"] or v.get("job_bytes", 0) or 0)
+        if v["last"] > g["last"]:
+            g["last"] = v["last"]
+            g["last_size"] = v["last_size"]
+            g["last_ok"] = v.get("last_ok")
+            g["last_ip"] = ip
+    items = []
+    host_notes = {}
+    for g in groups.values():
+        if g["key"] in hidden or any(ip in hidden for ip in g["ips"]):
+            continue
+        note = notes.get(g["key"], "")
+        if not note:
+            for ip in g["ips"]:
+                if notes.get(ip):
+                    note = notes[ip]
+                    break
+        if note and g["host"]:
+            host_notes[g["host"]] = note
+        items.append({"key": g["key"], "ip": g["last_ip"] or g["ips"][0],
+                      "ips": sorted(g["ips"]), "host": g["host"], "note": note,
+                      "n": g["n"], "bytes": g["bytes"], "last": g["last"],
+                      "last_size": g["last_size"], "last_ok": g["last_ok"]})
+    items.sort(key=lambda x: (x["last"], x["n"]), reverse=True)
+    return jsonify({"ok": True, "notes": notes, "host_notes": host_notes,
+                    "items": items, "max_len": NOTE_MAX_LEN})
+
+
+@app.route("/api/notes/delete", methods=["POST"])
+def api_notes_delete():
+    data = request.get_json(silent=True) or {}
+    key = str(data.get("key") or data.get("ip") or "").strip()
+    if not key:
+        return jsonify({"ok": False, "msg": "缺少来源标识"})
+    with cfg_lock:
+        hidden = CFG.setdefault("src_hidden", [])
+        if not isinstance(hidden, list):
+            hidden = []
+            CFG["src_hidden"] = hidden
+        if key not in hidden:
+            hidden.append(key)
+        CFG.get("notes", {}).pop(key, None)
+    save_config()
+    log("来源管理：已移除来源 %s" % key)
+    return jsonify({"ok": True, "msg": "已从来源列表移除 %s" % key})
 
 
 @app.route("/api/notes", methods=["POST"])
@@ -3408,7 +3682,7 @@ def api_notes_save():
     with cfg_lock:
         CFG["notes"] = cleaned
     save_config()
-    log("来源备注已更新，共 %d 条" % len(cleaned))
+    log("来源管理：备注已更新，共 %d 条" % len(cleaned))
     return jsonify({"ok": True, "msg": "已保存 %d 条来源备注" % len(cleaned), "notes": cleaned})
 
 
@@ -3880,6 +4154,14 @@ if __name__ == "__main__":
         log("（进程重启过，已从 data/panel.log 载入上次运行的 %d 行日志）" % _hist)
     log("配置文件：%s" % CONFIG_PATH)
     log("目标设备 ID：%s（可在网页「设备设置」里修改）" % PRINTER_ID)
+    # host 网络模式下 docker ps 看不到端口映射，这里直接把可用地址打印出来
+    _ip = primary_lan_ip()
+    if _ip:
+        log("面板地址：http://%s:%d" % (_ip, WEB_PORT))
+        log("打印端口：%s:%d（其他设备添加打印机时填这个）" % (_ip, PRINT_PORT))
+    else:
+        log("面板端口：%d，打印端口：%d（未能自动探测本机 IP，请用 NAS 的局域网 IP 访问）"
+            % (WEB_PORT, PRINT_PORT))
     if PYUSB_OK:
         log("pyusb 模块已加载")
     else:
@@ -3894,9 +4176,12 @@ if __name__ == "__main__":
             % (conf.get("channel"), int(conf.get("offline_alert_sec") or 60)))
     if auth_ready():
         log("访问密码已设置：打开面板只需输入密码（忘记可删 data/config.json 后重启重设）")
+    elif _ip:
+        log("尚未设置访问密码：请打开 http://%s:%d 按提示设置" % (_ip, WEB_PORT))
     else:
-        log("尚未设置访问密码：请打开 http://本机IP:8910 按提示设置")
+        log("尚未设置访问密码：请打开 http://本机IP:%d 按提示设置" % WEB_PORT)
     printer.connect()
     threading.Thread(target=print_server_loop, daemon=True).start()
     threading.Thread(target=watcher_loop, daemon=True).start()
+    threading.Thread(target=backfill_hosts, daemon=True).start()
     app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)
