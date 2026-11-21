@@ -1851,17 +1851,20 @@ def watcher_loop():
 AUTH_STYLE = """
 :root{--bg:#f2f5f9;--card:#fff;--line:#e3e8ef;--txt:#1b2530;--sub:#63707e;--brand:#0a84ff;--bad:#e5484d;--ok:#12a150;}
 *{box-sizing:border-box;margin:0;padding:0}
-body{display:flex;align-items:center;justify-content:center;min-height:100vh;background:linear-gradient(160deg,#eaf3ff,#f2f5f9 45%,#eef7f1);font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:var(--txt);padding:20px}
+/* 纵向排布：卡片 + 页脚都在文档流里，键盘弹出页面滚动时页脚跟着走，不会压到卡片上 */
+body{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;min-height:100dvh;background:linear-gradient(160deg,#eaf3ff,#f2f5f9 45%,#eef7f1);font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:var(--txt);padding:20px}
 .card{width:100%;max-width:390px;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:30px 26px;box-shadow:0 10px 30px rgba(20,40,70,.08)}
 h1{font-size:19px;font-weight:600;text-align:center}
 .tip{font-size:13px;color:var(--sub);text-align:center;margin-top:8px;line-height:1.6}
 label{display:block;font-size:13px;color:var(--sub);margin:18px 0 7px}
-input{width:100%;padding:12px 13px;border:1px solid var(--line);border-radius:10px;font-size:14px;outline:none;background:#fbfcfd}
+input{width:100%;padding:12px 13px;border:1px solid var(--line);border-radius:10px;font-size:16px;outline:none;background:#fbfcfd}
 input:focus{border-color:var(--brand);background:#fff}
 button{width:100%;margin-top:22px;padding:13px;border:none;border-radius:10px;background:var(--brand);color:#fff;font-size:15px;font-weight:600;cursor:pointer}
 button:active{transform:scale(.98)}
 .err{background:#fdecec;color:var(--bad);font-size:13px;padding:10px 12px;border-radius:10px;margin-top:16px;text-align:center;line-height:1.5}
 .note{font-size:12px;color:var(--sub);margin-top:16px;line-height:1.7;background:#f7fafc;border:1px solid var(--line);border-radius:10px;padding:11px 13px}
+/* 可视高度被键盘压得很短时，改成顶部对齐，避免居中把卡片上半截挤出屏幕 */
+@media (max-height:640px){body{justify-content:flex-start;padding-top:16px;padding-bottom:16px}}
 """
 
 # ==================== 页脚版权 ====================
@@ -1886,12 +1889,42 @@ FOOTER_CSS = (
     '.foot2 a{color:#98a3b1;text-decoration:underline}'
 )
 
-# 登录页 / 首次设置页的 body 是 flex 居中的，页脚要固定在底部居中，不能作为 flex 子项横排
+# 登录页 / 首次设置页：页脚跟卡片一样在文档流里（body 已改为纵向 flex），
+# 不用 position:fixed——固定定位在手机上弹出键盘、页面滚动时会被拖到卡片上，压住输入区
 AUTH_FOOTER_CSS = (
     FOOTER_CSS
-    + '.foot{position:fixed;left:0;right:0;bottom:12px;margin:0;padding:0 16px;'
-      'text-align:center;z-index:2}'
+    + '.foot{position:static;margin:18px 0 0;padding:0 16px;text-align:center;z-index:auto}'
 )
+
+# ==================== 内联 SVG 图标 ====================
+# 不用 emoji / 符号字符：部分手机系统缺对应字形，会显示成空白方框（豆腐块）
+
+ICONS = {
+    "gear": '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/>'
+            '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06'
+            'a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09'
+            'A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83'
+            'l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09'
+            'A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0'
+            'l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09'
+            'a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83'
+            'l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2'
+            'h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+    "power": '<svg viewBox="0 0 24 24"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>'
+             '<line x1="12" y1="2" x2="12" y2="12"/></svg>',
+    "printer": '<svg viewBox="0 0 24 24"><polyline points="6 9 6 2 18 2 18 9"/>'
+               '<path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/>'
+               '<rect x="6" y="14" width="12" height="8"/></svg>',
+    "tag": '<svg viewBox="0 0 24 24"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10'
+           'l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>',
+    "chart": '<svg viewBox="0 0 24 24"><line x1="18" y1="20" x2="18" y2="10"/>'
+             '<line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>',
+    "bell": '<svg viewBox="0 0 24 24"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>'
+            '<path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
+    "key": '<svg viewBox="0 0 24 24"><path d="M21 2l-2 2"/><circle cx="7.5" cy="15.5" r="5.5"/>'
+           '<path d="M11.5 11.5L16 7l2 2 2-2-2-2"/></svg>',
+}
+
 
 LICENSE_TEXT = """p910nd-panel 使用许可与声明
 Copyright (c) 2026 亦桉 · https://www.godr.cn/
@@ -2017,7 +2050,9 @@ body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;backgroun
 .iconbtn{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:11px;background:#f3f6fa;border:1px solid var(--line);color:var(--txt);text-decoration:none;font-size:17px;line-height:1;transition:background .15s,border-color .15s,color .15s,transform .12s}
 .iconbtn:hover{background:#e9f2ff;border-color:#cfe2ff;color:#0a63c8}
 .iconbtn:active{transform:scale(.96)}
-.iconbtn.out{background:#fff;color:var(--sub)}
+.iconbtn svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+/* 两个图标按钮保持同一底色，只有退出按钮悬停变红，避免一个白一个灰看着像两种样式 */
+.iconbtn.out{color:var(--sub)}
 .iconbtn.out:hover{background:#fdecec;border-color:#f6d3d4;color:var(--bad)}
 .stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px;margin-top:18px}
 .stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;min-width:0;display:flex;flex-direction:column;justify-content:center}
@@ -2111,7 +2146,7 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
 .pager{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:center;justify-content:stretch}
 .pager .pgsize{grid-column:1;margin-right:0;justify-self:start}
 .pager .pginfo{grid-column:2;justify-self:end;text-align:right}
-.pager button{width:100%;flex:0 0 auto;margin:0}}
+.pager button{width:100%;flex:0 0 auto;margin:0}input,select{font-size:16px}}
 %FOOTER_CSS%
 </style>
 </head>
@@ -2125,8 +2160,8 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
       </div>
       <div class="right">
         <div class="icnav">
-          <a class="iconbtn" href="/settings" title="设置" aria-label="设置">⚙</a>
-          <a class="iconbtn out" href="/logout" title="退出登录" aria-label="退出登录">⏻</a>
+          <a class="iconbtn" href="/settings" title="设置" aria-label="设置">%ICON_GEAR%</a>
+          <a class="iconbtn out" href="/logout" title="退出登录" aria-label="退出登录">%ICON_POWER%</a>
         </div>
       </div>
     </div>
@@ -2639,16 +2674,17 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
 .setrow:hover{background:#f4f9ff;border-color:#cfe2ff;transform:translateX(2px)}
 .setrow:active{transform:scale(.995)}
 .setic{flex:none;width:36px;height:36px;border-radius:10px;background:#eef4fc;display:flex;align-items:center;justify-content:center;font-size:17px}
+.setic svg{width:18px;height:18px;stroke:#1f6fd0;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
 .setinfo{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
 .setinfo b{font-size:14.5px;font-weight:600}
 .setinfo span{font-size:12px;color:var(--sub);line-height:1.6}
 .setgo{flex:none;color:#b6c1cc;font-size:20px;line-height:1}
-@media (max-width:560px){.bar{gap:8px}.nav{gap:6px}.nav a{padding:7px 4px;font-size:11.5px}}
+@media (max-width:560px){.bar{gap:8px}.nav{gap:6px}.nav a{padding:7px 4px;font-size:11.5px}input,select{font-size:16px}}
 """
 
 SETTINGS_PATH_ROWS = [("设备设置", "/device"), ("来源备注", "/notes"), ("数据管理", "/data"), ("推送配置", "/push"), ("修改密码", "/password")]
 
-SETTINGS_INDEX_ICON = {"设备设置": "⚙", "来源备注": "🏷", "数据管理": "📊", "推送配置": "🔔", "修改密码": "🔑"}
+SETTINGS_INDEX_ICON = {"设备设置": "printer", "来源备注": "tag", "数据管理": "chart", "推送配置": "bell", "修改密码": "key"}
 
 SETTINGS_INDEX_DESC = {
     "设备设置": "选择要共享的 USB 打印机设备，保存后立即重连。",
@@ -2665,7 +2701,7 @@ def settings_index_body():
         rows += ('<a class="setrow" href="%s"><span class="setic">%s</span>'
                  '<span class="setinfo"><b>%s</b><span>%s</span></span>'
                  '<span class="setgo">›</span></a>') % (
-                     href, SETTINGS_INDEX_ICON.get(label, "•"), label,
+                     href, ICONS.get(SETTINGS_INDEX_ICON.get(label, ""), ""), label,
                      SETTINGS_INDEX_DESC.get(label, ""))
     return '<div class="desc">面板的所有配置都在这里，点进去按需修改。</div><div class="setlist">%s</div>' % rows
 
@@ -3248,6 +3284,8 @@ def favicon():
 @app.route("/")
 def index():
     html = (HTML.replace("%FOOTER_CSS%", FOOTER_CSS)
+                .replace("%ICON_GEAR%", ICONS["gear"])
+                .replace("%ICON_POWER%", ICONS["power"])
                 .replace("%FOOTER%", footer_html())
                 .replace("%JOB_KEEP%", str(JOB_KEEP)))
     return Response(html, mimetype="text/html")
