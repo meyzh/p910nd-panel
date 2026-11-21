@@ -19,6 +19,9 @@ services:
     volumes:
       # 配置、账号、推送设置、打印任务记录都持久化在这里
       - ./data:/app/data
+      # 面板代码直接挂载：以后改了 panel.py 只要 restart 容器就生效，
+      # 不需要重新 build 镜像（NAS 上拉 debian 基础镜像经常 401/超时）
+      - ./panel.py:/app/panel.py:ro
     environment:
       - TZ=Asia/Shanghai
       # 注意：这里不再配置账号密码。

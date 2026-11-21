@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -100,12 +101,11 @@ state = {
     "bytes": 0,
     "last_job_time": "",
     "last_job_size": 0,
-    "last_job_ok": True,
     "last_error": "",
     "reconnects": 0,
 }
 
-push_info = {"count": 0, "last_time": "", "last_result": "", "last_title": ""}
+push_info = {"count": 0, "last_time": "", "last_result": ""}
 
 
 # ==================== 日志 ====================
@@ -402,11 +402,6 @@ def notes_conf():
         return dict(CFG.get("notes", {}) or {})
 
 
-def note_for(ip):
-    """来源机器的备注（没设过返回空串）"""
-    return notes_conf().get(ip, "")
-
-
 def auth_ready():
     """是否已经设置过访问密码"""
     return bool(auth_conf().get("hash"))
@@ -550,7 +545,6 @@ def do_push(title, content):
         push_info["count"] += 1
         push_info["last_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
         push_info["last_result"] = ("成功" if ok else "失败") + "：" + msg
-        push_info["last_title"] = title
     log("推送[%s] → %s（%s）" % (title, "成功" if ok else "失败", msg))
     return ok, msg
 
@@ -563,17 +557,252 @@ def push_html(lines):
     return "<br>".join(lines)
 
 
+# ==================== 打印机回传状态（PJL 双向通道） ====================
+#
+# 9100 RAW 一般只管写；但大多数打印机的 USB 接口同时暴露一个 Bulk IN 端点，
+# 可以用 PJL 的 @PJL INFO STATUS 问出当前状态（CODE= 数字 + DISPLAY= 文字）。
+# 这里做三件事：发查询、解析回包、把代码和英文面板文字翻成中文。
+
+PJL_STATUS_LOCK = threading.RLock()
+PJL_STATUS = {
+    "supported": None,   # None=还没试过；True=有 IN 端点；False=该机型没有回传通道
+    "code": "",          # 打印机回传的 CODE=
+    "en": "",            # DISPLAY= 的原文
+    "zh": "",            # 翻译成中文的状态
+    "code_zh": "",       # 代码段含义（HP PJL 附录 D 的分类）
+    "at": "",            # 最后一次成功读取的时间
+    "error": "",         # 读取失败的原因（面板上原样显示）
+    "online": None,      # 打印机自称 ONLINE=TRUE/FALSE
+}
+_LAST_STATUS_KEY = {"key": ""}
+
+# DISPLAY 英文面板文字 → 中文。按关键词匹配，命中多条就拼接。
+DISPLAY_ZH_RULES = [
+    (r"\bpaper jam\b|\bjam(m?ed)?\b", "卡纸"),
+    (r"\bout of paper\b|\bpaper out\b|\bpaper empty\b|\bno paper\b", "缺纸"),
+    (r"\bload paper\b|\badd paper\b|\binsert paper\b|\bmanual feed\b", "需要装纸"),
+    (r"\btray\s*\d*\s*empty\b|\bcassette\s*\d*\s*empty\b", "纸盒空"),
+    (r"\btray\s*\d*\s*open\b|\bcassette\s*\d*\s*open\b|\bdrawer open\b", "纸盒未插好"),
+    (r"\btoner low\b|\blow toner\b", "碳粉不足"),
+    (r"\btoner empty\b|\bno toner\b|\breplace toner\b|\btoner\b.*\bempty\b", "碳粉用尽，需更换"),
+    (r"\bwaste toner\b.*\b(full|near full)\b", "废粉仓将满"),
+    (r"\bdrum\b.*\b(low|empty|replace|life)\b", "感光鼓寿命将至"),
+    (r"\bcover open\b|\bdoor open\b|\bopen cover\b|\bopen door\b|\bclose cover\b|\bclose door\b", "盖板（机门）未关"),
+    (r"\boutput tray\b.*\bfull\b|\bstack full\b|\btray full\b", "出纸盘已满"),
+    (r"\bstaples?\b.*\b(empty|low|out)\b", "订书钉不足"),
+    (r"\bsleep(ing)?\b|\bpower save\b|\bstand ?by\b", "休眠中"),
+    (r"\bwarming up\b|\bwarm ?up\b", "预热中"),
+    (r"\binitializ", "初始化中"),
+    (r"\bcalibrat", "校准中"),
+    (r"\bprinting\b|\bprocessing\b|\bbusy\b", "正在打印"),
+    (r"\bready\b|\bidle\b", "就绪"),
+    (r"\boffline\b|\bnot ready\b", "离线（未就绪）"),
+    (r"\bfuser\b|\boverheat\b|\btemperature\b", "定影单元异常（温度）"),
+    (r"\bpaper\b.*\bmismatch\b|\bmedia\b.*\bmismatch\b|\bincorrect paper\b|\bpaper size\b", "纸张规格与任务不符"),
+    (r"\bduplex\b", "双面单元异常"),
+    (r"\bmemory full\b", "内存不足"),
+    (r"\bdisk\b.*\bfull\b", "存储空间已满"),
+    (r"\bnetwork\b.*\berror\b", "网络异常"),
+    (r"\bservice call\b|\bcall service\b|\berror\b", "打印机故障（需检修）"),
+    (r"\bpaused\b|\bcancel", "任务被暂停/取消"),
+    (r"\battention\b|\bcheck\b", "需要人工确认"),
+]
+
+# HP PJL 附录 D 的代码分段（只到“这一段代表什么”这一层，不逐条编造）
+PJL_CODE_RANGES = [
+    (10000, 10999, "状态/耗材提示类信息（一般不影响继续打印）"),
+    (11000, 11999, "后台送纸提示（如请装纸）"),
+    (12000, 12999, "纸盒状态提示（缺纸、纸盒未到位）"),
+    (15000, 15999, "出纸仓状态提示（出纸盘满）"),
+    (20000, 20999, "PJL 解析错误（命令写法有问题）"),
+    (25000, 25999, "PJL 解析警告"),
+    (27000, 27999, "PJL 语义错误（参数不被支持）"),
+    (30000, 30999, "可自动恢复的异常（打印机自行处理）"),
+    (32000, 32999, "PJL 文件系统错误"),
+    (35000, 35999, "潜在需人工介入（建议检查纸张/耗材）"),
+    (40000, 40999, "需人工介入：缺纸 / 卡纸 / 盖板未关 / 耗材用尽等"),
+    (41000, 41999, "需人工送纸（手动进纸）"),
+    (42000, 42999, "卡纸"),
+    (43000, 43999, "外部/附加送纸设备异常"),
+]
+
+
+def explain_pjl_code(code):
+    """把 CODE= 的数字翻成“这一段的含义”，翻不出来就空着"""
+    try:
+        n = int(str(code).strip())
+    except Exception:
+        return ""
+    for lo, hi, zh in PJL_CODE_RANGES:
+        if lo <= n <= hi:
+            return zh
+    return ""
+
+
+def translate_display(text):
+    """把 DISPLAY=（英文面板文字）翻成中文；翻不出来时返回空字符串"""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    lower = raw.lower()
+    hits = []
+    for pat, zh in DISPLAY_ZH_RULES:
+        if re.search(pat, lower) and zh not in hits:
+            hits.append(zh)
+    if not hits:
+        return ""
+    # 「就绪」单独命中时别再拼别的东西，避免出现「就绪、正在打印」
+    if len(hits) > 1 and "就绪" in hits and ("正在打印" in hits or "预热中" in hits or "初始化中" in hits):
+        hits = [h for h in hits if h != "就绪"]
+    return "、".join(hits)
+
+
+def printer_status_snapshot():
+    with PJL_STATUS_LOCK:
+        return dict(PJL_STATUS)
+
+
+def set_printer_status(**kw):
+    with PJL_STATUS_LOCK:
+        for k, v in kw.items():
+            if k in PJL_STATUS:
+                PJL_STATUS[k] = v
+
+
+def printer_status_text():
+    """面板上显示的一句话：有中文状态就用中文，否则退回原文或错误"""
+    with PJL_STATUS_LOCK:
+        st = dict(PJL_STATUS)
+    if st["code"] or st["zh"] or st["en"]:
+        main = st["zh"] or st["en"] or st["code_zh"]
+        return main or "已收到状态"
+    if st["supported"] is False:
+        return "该机型没有回传通道（未暴露 Bulk IN 端点）"
+    if st["error"]:
+        return "读取失败：%s" % st["error"]
+    return "尚未读取（等待下一个查询周期）"
+
+
+def format_status_brief():
+    """给任务记录/日志用的一行摘要：卡纸（CODE=40022 · 需人工介入…）"""
+    st = printer_status_snapshot()
+    parts = []
+    if st.get("zh") or st.get("en"):
+        parts.append(st.get("zh") or st.get("en"))
+    if st.get("code"):
+        code_part = "CODE=%s" % st["code"]
+        if st.get("code_zh"):
+            code_part += "（%s）" % st["code_zh"]
+        parts.append(code_part)
+    return " · ".join(parts)
+
+
+def has_cjk(text):
+    """文本里是否已经含中文/日文——有就不用再按英文词表翻"""
+    return bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uff66-\uff9f]", str(text or "")))
+
+
+# DISPLAY= 里的字节编码各家不同（京瓷常按面板语言回 GBK / Shift-JIS，也有机器回 UTF-8），
+# 这里逐个试解，按“像不像正常文本”打分挑最靠谱的那个。
+STATUS_ENCODINGS = (
+    ("gb18030", 3),      # 中文面板最常见
+    ("shift_jis", 5),    # 日文面板
+    ("cp932", 3),
+    ("big5", 1),         # 繁体
+)
+
+
+def _score_text(s):
+    score = 0
+    for ch in s:
+        o = ord(ch)
+        if 0x4E00 <= o <= 0x9FFF:          # 汉字
+            score += 4
+        elif 0x3040 <= o <= 0x30FF:        # 假名
+            score += 4
+        elif 32 <= o < 127:                # 可打印 ASCII
+            score += 2
+        elif 0xFF01 <= o <= 0xFF5E:        # 全角字符
+            score += 2
+        elif o < 32:                       # 控制字符
+            score -= 3
+        elif 0x80 <= o <= 0x2FF:           # 拉丁扩展 / 修饰符：解错时的典型产物
+            score -= 6
+        elif 0x2500 <= o <= 0x257F:        # 制表符块
+            score -= 6
+        else:
+            score -= 1
+    return score
+
+
+def smart_decode_text(raw):
+    """把 DISPLAY= 的原始字节解成可读文本。
+
+    顺序很重要：先看是不是 UTF-8（能严格解出且内容是正常文字就直接用），
+    再按 GBK / Shift-JIS / Big5 逐个试，最后才退回 latin-1。
+    全部都不像正常文本时返回空字符串，由调用方提示“回传文字无法识别”。
+    """
+    if isinstance(raw, str):
+        raw = raw.encode("latin-1", "ignore")
+    raw = bytes(raw)
+    if not raw:
+        return ""
+
+    # 1) 严格 UTF-8 且内容正常：直接采用（中文/英文都常见）
+    try:
+        s = raw.decode("utf-8")
+        if _score_text(s) >= 2:
+            return s
+    except Exception:
+        pass
+
+    # 2) UTF-16（有些固件按双字节回）：整串高低字节明显成对时试一下
+    if len(raw) >= 4 and raw.count(0) >= len(raw) // 3:
+        for enc in ("utf-16-le", "utf-16-be"):
+            try:
+                s = raw.decode(enc)
+            except Exception:
+                continue
+            if has_cjk(s) and _score_text(s) >= 6:
+                return s
+
+    # 3) 常见中文 / 日文 / 繁体编码
+    best, best_score = "", -999
+    for enc, bonus in STATUS_ENCODINGS:
+        try:
+            s = raw.decode(enc)
+        except Exception:
+            continue
+        sc = _score_text(s) + bonus
+        if sc > best_score:
+            best, best_score = s, sc
+
+    if best_score >= 4:
+        return best
+
+    # 4) 兜底：英文之外没有可用信息就如实说“识别不了”，别把乱码显示到面板
+    try:
+        s = raw.decode("latin-1")
+    except Exception:
+        return ""
+    if re.search(r"[A-Za-z]{2,}", s) or _score_text(s) >= 4:
+        return s
+    return ""
+
+
 # ==================== USB 打印机 ====================
 
 class UsbPrinter(object):
     def __init__(self):
         self.dev = None
         self.ep_out = None
+        self.ep_in = None
         self.iface_num = None
         self.sig = None
         self.io_lock = threading.Lock()
         self._fail_log = {"msg": "", "ts": 0}
         self._last_reset = 0
+        self._status_at = 0.0
 
     def _find_dev(self):
         if not PYUSB_OK:
@@ -624,6 +853,7 @@ class UsbPrinter(object):
                 pass
         self.dev = None
         self.ep_out = None
+        self.ep_in = None
         self.iface_num = None
         self.sig = None
 
@@ -758,12 +988,12 @@ class UsbPrinter(object):
         return self._sysfs_present(VID, PID)
 
     @staticmethod
-    def _sysfs_endpoint(vid, pid):
-        """不依赖 USB 控制传输，直接从 sysfs 读出打印接口号和输出端点地址。
+    def _sysfs_endpoints(vid, pid):
+        """不依赖 USB 控制传输，直接从 sysfs 读出打印接口的端点信息。
 
         拔插后设备可能连 GET_CONFIGURATION 都返回 EIO，但只要设备在，
         sysfs 里的 bInterfaceClass / bEndpointAddress 一定读得到。
-        返回 (bInterfaceNumber, bEndpointAddress) 或 None。
+        返回 (接口号, 输出端点, 输入端点) 或 None；输入端点不存在时为 None。
         """
         base = "/sys/bus/usb/devices"
         try:
@@ -800,6 +1030,8 @@ class UsbPrinter(object):
                     continue
                 if cls != 7:
                     continue
+                ep_out = None
+                ep_in = None
                 try:
                     eps = os.listdir(sub)
                 except Exception:
@@ -816,18 +1048,30 @@ class UsbPrinter(object):
                         continue
                     if typ != 2:          # 2 = Bulk
                         continue
-                    if addr & 0x80:       # 0x80 置位是 IN，跳过
-                        continue
-                    return num, addr
+                    if addr & 0x80:       # 0x80 置位是 IN：状态回传走这个端点
+                        if ep_in is None:
+                            ep_in = addr
+                    elif ep_out is None:
+                        ep_out = addr
+                if ep_out is not None:
+                    return num, ep_out, ep_in
         return None
+
+    @staticmethod
+    def _sysfs_endpoint(vid, pid):
+        """兼容旧调用：只要 (接口号, 输出端点)"""
+        hit = UsbPrinter._sysfs_endpoints(vid, pid)
+        if not hit:
+            return None
+        return hit[0], hit[1]
 
     def _open_once(self, dev, silent=False):
         cfg, how, cerr = self._config_for(dev)
         if cfg is None:
             # 控制传输全挂：改用 sysfs 端点 + usbfs 直接 bulk 写，完全不发控制请求
-            hit = self._sysfs_endpoint(VID, PID)
+            hit = self._sysfs_endpoints(VID, PID)
             if hit:
-                num, addr = hit
+                num, addr, addr_in = hit
                 try:
                     usb.util.claim_interface(dev, num)
                 except Exception as exc:
@@ -836,6 +1080,7 @@ class UsbPrinter(object):
                 self.dev = dev
                 self.iface_num = num
                 self.ep_out = addr
+                self.ep_in = addr_in
                 self.sig = "%s-%s" % (getattr(dev, "bus", ""), getattr(dev, "address", ""))
                 set_state(
                     usb_online=True,
@@ -845,7 +1090,9 @@ class UsbPrinter(object):
                     usb_speed=self._speed_text(dev),
                     last_error="",
                 )
-                log("USB 控制传输异常，已改用 sysfs 端点 0x%02x 直写连接：%s" % (addr, cerr))
+                set_printer_status(supported=addr_in is not None)
+                log("USB 控制传输异常，已改用 sysfs 端点 0x%02x 直写连接（状态端点：%s）：%s"
+                    % (addr, ("0x%02x" % addr_in) if addr_in else "无", cerr))
                 self._fail_log = {"msg": "", "ts": 0}
                 return True
             self._log_fail("读取 USB 配置失败：%s（sysfs 也取不到端点）" % cerr)
@@ -903,8 +1150,18 @@ class UsbPrinter(object):
 
         self.dev = dev
         self.ep_out = ep_out
+        try:
+            ep_in = usb.util.find_descriptor(
+                iface,
+                custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
+                == usb.util.ENDPOINT_IN,
+            )
+        except Exception:
+            ep_in = None
+        self.ep_in = ep_in
         self.iface_num = iface.bInterfaceNumber
         self.sig = "%s-%s" % (getattr(dev, "bus", ""), getattr(dev, "address", ""))
+        set_printer_status(supported=ep_in is not None)
 
         product = self._get_product(dev)
         set_state(
@@ -955,6 +1212,11 @@ class UsbPrinter(object):
         with self.io_lock:
             was_ready = self.ep_out is not None
             self._close()
+        if was_ready:
+            # 句柄都没了，之前读到的那条状态已经过期，不能继续显示
+            set_printer_status(code="", en="", zh="", code_zh="", online=None,
+                               error="打印机未连接",
+                               at=time.strftime("%Y-%m-%d %H:%M:%S"))
         if was_ready and reason:
             log(reason)
 
@@ -1029,6 +1291,126 @@ class UsbPrinter(object):
                             continue
                         time.sleep(0.2)
                 offset += written if written else len(buf)
+
+    def _raw_write(self, data, timeout_ms):
+        """底层写，不触发“写失败就置离线”的那套处理，专供 PJL 查询用"""
+        if isinstance(self.ep_out, int):
+            self.dev.write(self.ep_out, data, timeout=timeout_ms)
+        else:
+            self.ep_out.write(data, timeout=timeout_ms)
+
+    def _raw_read(self, size, timeout_ms):
+        if isinstance(self.ep_in, int):
+            return bytes(self.dev.read(self.ep_in, size, timeout=timeout_ms))
+        return bytes(self.ep_in.read(size, timeout=timeout_ms))
+
+    def query_status(self, wait_ms=2500):
+        """用 PJL 的 @PJL INFO STATUS 问一次打印机状态。
+
+        打印机回的是：
+            CODE=40022
+            DISPLAY="PAPER JAM"
+            ONLINE=TRUE
+        解析出 CODE 与 DISPLAY 后就翻成中文塞进 PJL_STATUS。
+        整套流程用 try 兜住：读状态失败绝不能让打印任务挂掉。
+        """
+        if self.ep_out is None:
+            set_printer_status(error="打印机未连接")
+            return None
+        if self.ep_in is None:
+            set_printer_status(supported=False, error="该机型未暴露 Bulk IN 端点，无法回传状态",
+                               at=time.strftime("%Y-%m-%d %H:%M:%S"))
+            return None
+        with self.io_lock:
+            if self.ep_out is None or self.ep_in is None:
+                return None
+            try:
+                # 先清掉上一次残留的回包，避免把旧状态当成新状态
+                try:
+                    for _ in range(4):
+                        self._raw_read(256, 200)
+                except Exception:
+                    pass
+
+                req = b"\x1b%-12345X@PJL INFO STATUS\r\n\x1b%-12345X\r\n"
+                self._raw_write(req, USB_TIMEOUT_MS)
+                deadline = time.time() + max(0.5, wait_ms / 1000.0)
+                buf = b""
+                while time.time() < deadline and len(buf) < 4096:
+                    try:
+                        chunk = self._raw_read(512, 400)
+                    except Exception as exc:
+                        if self._is_timeout(exc):
+                            break
+                        raise
+                    if not chunk:
+                        time.sleep(0.05)
+                        continue
+                    buf += chunk
+                    if b"CODE=" in buf and buf.count(b"\x0c") >= 2:
+                        break
+                    if b"CODE=" in buf and b"DISPLAY=" in buf and b"\x0c" in buf[-8:]:
+                        break
+            except Exception as exc:
+                msg = str(exc) or exc.__class__.__name__
+                set_printer_status(error="读取状态失败：%s" % msg,
+                                   at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                log("读取打印机状态失败：%s" % msg)
+                return None
+
+            if not buf:
+                set_printer_status(error="打印机没有回应状态查询（可能不支持 PJL 状态回读）",
+                                   at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                return printer_status_snapshot()
+
+            code = ""
+            display = ""
+            disp_raw = b""
+            online = None
+            m = re.search(rb"CODE\s*=\s*(\d+)", buf)
+            if m:
+                code = m.group(1).decode("ascii", "ignore")
+            m = re.search(rb'DISPLAY\s*=\s*"([^"]*)"', buf)
+            if m:
+                disp_raw = m.group(1)
+            else:
+                m = re.search(rb"DISPLAY\s*=\s*([^\r\n\x0c]+)", buf)
+                if m:
+                    disp_raw = m.group(1).strip().strip(b'"')
+            display = smart_decode_text(disp_raw).strip()
+            m = re.search(rb"ONLINE\s*=\s*(TRUE|FALSE)", buf, re.I)
+            if m:
+                online = m.group(1).upper() == b"TRUE"
+
+            if disp_raw and not display:
+                # 解码不出来也要留证据，方便按真实字节再补编码规则
+                hexkey = "hex|%s" % disp_raw[:32].hex(" ")
+                if hexkey != _LAST_STATUS_KEY.get("hex"):
+                    _LAST_STATUS_KEY["hex"] = hexkey
+                    log("打印机回传的状态文字无法识别，原始字节：%s" % disp_raw[:64].hex(" "))
+
+            if not code and not display:
+                set_printer_status(error="回包里没有 CODE/DISPLAY（该机型可能不按 PJL 规范回包）",
+                                   at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                log("打印机状态回包无法解析，原始字节：%s" % buf[:160].hex(" "))
+                return printer_status_snapshot()
+
+            # 打印机自带中文/日文文字时直接用，别硬翻成英文对照表
+            if has_cjk(display):
+                zh = display
+            else:
+                zh = translate_display(display)
+            code_zh = explain_pjl_code(code)
+            set_printer_status(code=code, en=display, zh=zh, code_zh=code_zh,
+                               online=online, supported=True, error="",
+                               at=time.strftime("%Y-%m-%d %H:%M:%S"))
+
+        brief = format_status_brief()
+        key = "%s|%s" % (code, display)
+        if brief and key != _LAST_STATUS_KEY.get("key"):
+            _LAST_STATUS_KEY["key"] = key
+            log("打印机状态：%s（原始：%s）" % (brief, (display or "无文字说明")))
+        return printer_status_snapshot()
 
 
 printer = UsbPrinter()
@@ -1244,6 +1626,9 @@ def handle_job(conn, addr):
         if not printer.is_ready():
             if not printer.connect(silent=True):
                 raise RuntimeError("打印机未就绪")
+        # 任务开始前先问一次打印机自己的状态（缺纸 / 卡纸 / 盖板未关都能提前看到）
+        printer.query_status()
+        record["pstatus"] = format_status_brief()
         conn.settimeout(60)
         while True:
             try:
@@ -1254,8 +1639,13 @@ def handle_job(conn, addr):
                 break
             printer.write(data)
             total += len(data)
+        # 任务写完再问一次：卡纸、缺纸这类问题通常在打印过程中才出现
+        if total:
+            printer.query_status()
+            record["pstatus"] = format_status_brief()
     except Exception as exc:
         ok = False
+        failed_brief = format_status_brief()   # 先把此刻的状态摘出来，disconnect 会清空它
         printer.disconnect()
         set_state(
             usb_online=False,
@@ -1266,6 +1656,9 @@ def handle_job(conn, addr):
             last_error=str(exc),
         )
         record["msg"] = str(exc) or exc.__class__.__name__
+        if failed_brief:
+            record["pstatus"] = failed_brief
+            record["msg"] += "；打印机状态：%s" % failed_brief
         log("打印任务失败（来源 %s）：%s" % (ip, record["msg"]))
         notify_job_fail(peer, record["msg"], total)
     finally:
@@ -1281,7 +1674,6 @@ def handle_job(conn, addr):
                 state["jobs"] += 1
                 state["bytes"] += total
                 state["last_job_size"] = total
-            state["last_job_ok"] = ok
             state["last_job_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
         record["size"] = total
         record["seconds"] = round(time.time() - started, 2)
@@ -1384,7 +1776,9 @@ def watcher_loop():
             if dev is None:
                 connect_fail_streak = 0
                 # 只要之前连过（状态里是已连接，或句柄还没释放），就记一条断开日志
-                if state["usb_online"] or printer.ep_out is not None:
+                with lock:
+                    was_online = bool(state["usb_online"])
+                if was_online or printer.ep_out is not None:
                     printer.disconnect()
                     set_state(
                         usb_online=False,
@@ -1436,6 +1830,13 @@ def watcher_loop():
                             log("USB 连接连续失败，已清理旧句柄并准备重启进程重试")
                         if connect_fail_streak >= 4:
                             restart_self()
+                # 空闲时每 20 秒问一次打印机状态（正在打印时不插队，避免搅乱数据流）
+                try:
+                    if printer.is_ready() and not job_lock.locked() and (time.time() - printer._status_at) >= 20:
+                        printer._status_at = time.time()
+                        printer.query_status()
+                except Exception as exc:
+                    log("定时读取打印机状态异常：%s" % exc)
         except Exception as exc:
             log("USB 守护线程异常：%s" % exc)
         # 正常时 3 秒一次；连续失败时逐步拉长到 30 秒，避免反复操作把设备弄僵
@@ -1606,22 +2007,42 @@ body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;backgroun
 .wrap{max-width:1020px;margin:0 auto}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px}
 .mt{margin-top:16px}
-.head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
-.title{font-size:20px;font-weight:600}
+.head{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:nowrap}
+.hinfo{flex:1 1 auto;min-width:0}
+.title{font-size:20px;font-weight:600;letter-spacing:.2px}
 .sub{font-size:13px;color:var(--sub);margin-top:6px}
-.right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.pill{display:inline-flex;align-items:center;gap:8px;font-size:14px;padding:9px 15px;border-radius:999px;font-weight:600}
-.pill.ok{background:#e7f7ee;color:var(--ok)}
-.pill.bad{background:#fdecec;color:var(--bad)}
-.pill.warn{background:#fdf4e3;color:#b4791f}
-.dot{width:9px;height:9px;border-radius:50%;background:currentColor}
-.user{font-size:13px;color:var(--sub)}
-.link{font-size:13px;color:var(--brand);text-decoration:none}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-top:18px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+.sub b{color:var(--txt);font-weight:600}
+.right{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.icnav{display:flex;gap:8px;align-items:center;flex:none}
+.iconbtn{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:11px;background:#f3f6fa;border:1px solid var(--line);color:var(--txt);text-decoration:none;font-size:17px;line-height:1;transition:background .15s,border-color .15s,color .15s,transform .12s}
+.iconbtn:hover{background:#e9f2ff;border-color:#cfe2ff;color:#0a63c8}
+.iconbtn:active{transform:scale(.96)}
+.iconbtn.out{background:#fff;color:var(--sub)}
+.iconbtn.out:hover{background:#fdecec;border-color:#f6d3d4;color:var(--bad)}
+.stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px;margin-top:18px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;min-width:0;display:flex;flex-direction:column;justify-content:center}
 .stat .k{font-size:13px;color:var(--sub)}
 .stat .v{font-size:20px;font-weight:700;margin-top:8px}
 .stat .v.small{font-size:15px}
+.stat.wide{grid-column:span 3}
+.stat.tri{grid-column:span 2;text-align:center;align-items:center}
+.stat.wide .khint{font-size:11.5px;color:#9aa7b4;margin-left:6px}
+.svcrow{display:flex;align-items:center;gap:8px;margin-top:8px}
+.svcrow .v{margin:0}
+.svcdot{width:8px;height:8px;border-radius:50%;background:#b6c1cc;flex:none}
+.svcdot.ok{background:var(--ok)}
+.svcdot.warn{background:#c8922a}
+.svcdot.bad{background:var(--bad)}
+.svcstate{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:12px;padding-top:11px;border-top:1px dashed var(--line)}
+.svcmain{font-size:14.5px;font-weight:700;line-height:1.4;word-break:break-word;color:var(--txt)}
+.svcstate.ok .svcmain{color:var(--ok)}
+.svcstate.warn .svcmain{color:#a8751a}
+.svcstate.bad .svcmain{color:var(--bad)}
+.svcstate.idle .svcmain{color:var(--sub)}
+.svcat{font-size:11.5px;color:#9aa7b4;font-weight:400}
+.svcmeta{margin-top:5px;font-size:12px;color:var(--sub);line-height:1.55;word-break:break-word}
+.svcmeta b{color:var(--txt);font-weight:600}
+.connmeta{margin-top:6px;font-size:12px;color:var(--sub)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-top:14px}
 .rowitem{background:var(--card);padding:13px 16px;display:flex;justify-content:space-between;gap:10px;font-size:14px}
 .rowitem .k{color:var(--sub);flex:none}
@@ -1631,7 +2052,6 @@ button{border:none;border-radius:10px;padding:11px 18px;font-size:14px;font-weig
 button:active{transform:scale(.97)}
 .b1{background:var(--brand);color:#fff}
 .b2{background:#eaf2fb;color:#21507d}
-.b3{background:#eaf7ef;color:#0f7a44}
 .b4{background:#f2f4f7;color:#4a5562}
 h3{font-size:15px;font-weight:600;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;gap:10px}
 h3 .hint{font-size:12px;color:var(--sub);font-weight:400}
@@ -1657,15 +2077,16 @@ h3 .hint{font-size:12px;color:var(--sub);font-weight:400}
 .bar.fail{background:#e5484d}
 .dt{font-size:10.5px;color:var(--sub);margin-top:6px;white-space:nowrap;flex:none}
 .col{cursor:pointer;border-radius:6px}
+.col.ph{cursor:default;align-self:stretch}
 .col:hover{background:#f1f6fd}
 .col.on{background:#eaf2fb}
 .col.on .dt{color:var(--brand);font-weight:600}
 .daydetail{margin-top:12px;border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:#fbfcfd;font-size:13px}
-.ddhead{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.ddhead{position:relative;padding-right:58px;margin-bottom:10px;line-height:1.75}
 .ddhead b{font-size:13.5px}
-.ddsum{font-size:12.5px;color:var(--sub)}
+.ddsum{font-size:12.5px;color:var(--sub);margin-left:8px}
 .ddsum em{font-style:normal;color:var(--brand);font-weight:600}
-.ddclose{border:none;background:none;color:var(--sub);font-size:12px;cursor:pointer;padding:2px 6px}
+.ddclose{position:absolute;top:-2px;right:0;border:none;background:none;color:var(--sub);font-size:12px;cursor:pointer;padding:2px 6px;line-height:1.4}
 .ddlist{display:flex;flex-direction:column;gap:6px}
 .ddrow{display:flex;align-items:center;gap:10px;padding:7px 10px;background:#fff;border:1px solid var(--line);border-radius:9px;font-size:12.5px}
 .ddrow .ip{font-weight:600;color:var(--txt)}
@@ -1681,19 +2102,16 @@ tr:last-child td{border-bottom:none}
 td.ok{color:var(--ok);font-weight:600}
 td.bad{color:var(--bad);font-weight:600}
 .empty{text-align:center;color:var(--sub);padding:22px;font-size:13px}
-.form{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
-.field{display:flex;flex-direction:column;gap:7px}
-.field label{font-size:13px;color:var(--sub)}
-.chgrid{grid-column:1/-1;display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:14px}
-.chk{display:flex;align-items:center;gap:8px;font-size:13.5px;cursor:pointer}
-.chk input{width:17px;height:17px;padding:0;cursor:pointer}
 input,select{padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px;outline:none;background:#fbfcfd;color:var(--txt)}
 input:focus,select:focus{border-color:var(--brand);background:#fff}
-.check{display:flex;align-items:center;gap:8px;font-size:14px;padding-top:24px}
-.check input{width:18px;height:18px;padding:0}
 .logbox{background:#0f1720;color:#7ee0a4;border-radius:12px;padding:14px;height:280px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:13px;line-height:1.65;white-space:pre-wrap}
 .foot{text-align:center;font-size:12px;color:var(--sub);margin:16px 0 4px}
-@media (max-width:560px){.title{font-size:17px}.stat .v{font-size:17px}button{flex:1 1 45%}}
+@media (max-width:700px){.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.stat.wide{grid-column:span 3}.stat.tri{grid-column:span 1}}
+@media (max-width:560px){.title{font-size:17px}.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.stat.wide,.stat.tri{grid-column:auto}.stat.wide{grid-column:span 3}.stat{padding:12px}.stat .k{font-size:11.5px}.stat .v{font-size:16px;margin-top:5px}button{flex:1 1 45%}.iconbtn{width:34px;height:34px;font-size:15px}
+.pager{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:center;justify-content:stretch}
+.pager .pgsize{grid-column:1;margin-right:0;justify-self:start}
+.pager .pginfo{grid-column:2;justify-self:end;text-align:right}
+.pager button{width:100%;flex:0 0 auto;margin:0}}
 %FOOTER_CSS%
 </style>
 </head>
@@ -1701,25 +2119,47 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
 <div class="wrap">
   <div class="card">
     <div class="head">
-      <div>
+      <div class="hinfo">
         <div class="title">USB 打印机共享面板</div>
-        <div class="sub">RAW 打印端口 9100 · 面板端口 8910 · 目标设备 <span id="devid">--</span></div>
+        <div class="sub">目标设备 <span id="devid">--</span></div>
       </div>
       <div class="right">
-        <div id="pill" class="pill warn"><span class="dot"></span><span id="pilltext">检测中</span></div>
-        <a class="link" href="/device">设备设置</a>
-        <a class="link" href="/push">推送配置</a>
-        <a class="link" href="/password">修改密码</a>
-        <a class="link" href="/logout">退出登录</a>
+        <div class="icnav">
+          <a class="iconbtn" href="/settings" title="设置" aria-label="设置">⚙</a>
+          <a class="iconbtn out" href="/logout" title="退出登录" aria-label="退出登录">⏻</a>
+        </div>
       </div>
     </div>
 
     <div class="stats">
-      <div class="stat"><div class="k">打印机连接</div><div class="v" id="s_usb">--</div></div>
-      <div class="stat"><div class="k">打印服务</div><div class="v" id="s_port">--</div></div>
-      <div class="stat"><div class="k">累计任务</div><div class="v" id="s_jobs">0</div></div>
-      <div class="stat"><div class="k">累计数据</div><div class="v small" id="s_bytes">0 B</div></div>
-      <div class="stat"><div class="k">来源设备数</div><div class="v" id="s_src">0</div></div>
+      <div class="stat wide" id="stat_conn">
+        <div class="k">打印机连接 <span class="khint">USB 设备连接 + 服务运行状态</span></div>
+        <div class="svcrow">
+          <span class="svcdot" id="s_usbdot"></span>
+          <span class="v" id="s_usb">--</span>
+        </div>
+        <div class="svcstate idle" id="svcconn">
+          <span class="svcdot" id="svc_dot"></span>
+          <span class="svcmain" id="svc_main">检测中</span>
+        </div>
+        <div class="connmeta" id="i_connmeta">USB 直连 · 共享端口 9100</div>
+      </div>
+      <div class="stat wide" id="stat_svc">
+        <div class="k">打印服务 <span class="khint">9100 端口监听 + 打印机回传状态</span></div>
+        <div class="svcrow">
+          <span class="svcdot" id="s_portdot"></span>
+          <span class="v" id="s_port">--</span>
+        </div>
+        <div class="svcstate idle" id="svcstate">
+          <span class="svcdot" id="ps_dot"></span>
+          <span class="svcmain" id="i_pstate">读取中…</span>
+          <span class="svcat" id="i_pat"></span>
+        </div>
+        <div class="svcmeta" id="i_pcode">正在向打印机查询状态…</div>
+      </div>
+      <div class="stat tri"><div class="k">累计任务</div><div class="v" id="s_jobs">0</div></div>
+      <div class="stat tri"><div class="k">累计数据</div><div class="v small" id="s_bytes">0 B</div></div>
+      <div class="stat tri"><div class="k">来源设备数</div><div class="v" id="s_src">0</div></div>
     </div>
 
     <div class="grid">
@@ -1735,18 +2175,16 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
 
     <div class="btns">
       <button class="b1" onclick="refresh()">立即刷新</button>
-      <button class="b2" onclick="reconnect()">重连打印机</button>
-      <button class="b3" onclick="testpage()">打印测试页</button>
-      <button class="b2" onclick="pushtest()">测试推送</button>
-      <button class="b4" onclick="restartPanel()">重启服务</button>
       <button class="b4" id="autobtn" onclick="toggleAuto()">自动刷新：开</button>
+      <button class="b2" onclick="reconnect()">重连打印机</button>
+      <button class="b4" onclick="restartPanel()">重启服务</button>
     </div>
   </div>
 
   <div class="card mt">
     <h3>打印统计 <span class="hint" id="statHint">--</span></h3>
     <div class="toolbar">
-      <select id="statDays" onchange="loadStats(true)">
+      <select id="statDays" onchange="onStatDays(this.value)">
         <option value="7">近 7 天</option>
         <option value="14" selected>近 14 天</option>
         <option value="30">近 30 天</option>
@@ -1771,6 +2209,7 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
     <div class="pager">
       <label class="pgsize">每页
         <select id="jobsize" onchange="setJobPageSize(this.value)">
+          <option value="5">5</option>
           <option value="10">10</option>
           <option value="20">20</option>
           <option value="30">30</option>
@@ -1802,6 +2241,48 @@ function fmtBytes(n){
   return (i===0? v : v.toFixed(1))+" "+u[i];
 }
 function setText(id,txt){var e=document.getElementById(id);if(e)e.innerText=txt;}
+
+/* ---- 打印机回传状态（PJL）：整条状态带，主状态 + 代码 + 原文 ---- */
+function pstatLevel(st){
+  if(!st) return "idle";
+  if(st.online === false) return "bad";
+  var code = String(st.code || ""), n = parseInt(code, 10);
+  if(code && !isNaN(n)){
+    if(n >= 40000) return "bad";
+    if(n >= 30000) return "warn";
+    if(n >= 10000) return "ok";
+  }
+  var m = String(st.main || "");
+  if(/卡纸|缺纸|用尽|未关|故障|错误|检修/.test(m)) return "bad";
+  if(/不足|将满|规格不符|异常/.test(m)) return "warn";
+  if(/就绪|正常|已收到/.test(m)) return "ok";
+  if(/休眠|预热|初始化|校准|打印中/.test(m)) return "idle";
+  if(st.error) return "warn";
+  return "idle";
+}
+function paintPstatus(st){
+  var main = "读取中…", meta = "正在向打印机查询状态…", at = "", cls = "idle";
+  if(st){
+    main = st.main || "未读取到状态";
+    cls = pstatLevel(st);
+    var bits = [];
+    if(st.code){
+      bits.push("<b>CODE=" + esc(st.code) + "</b>" + (st.code_zh ? " · " + esc(st.code_zh) : ""));
+    }else if(st.code_zh){
+      bits.push(esc(st.code_zh));
+    }
+    if(st.en && st.en !== main) bits.push("原文：" + esc(st.en));
+    if(st.error && !st.code) bits.push(esc(st.error));
+    meta = bits.join(" · ") || "打印机未回传具体状态";
+    at = st.at ? "更新于 " + st.at : "";
+  }
+  var e;
+  if(e = document.getElementById("svcstate")) e.className = "svcstate " + cls;
+  if(e = document.getElementById("ps_dot")) e.className = "svcdot " + cls;
+  if(e = document.getElementById("i_pstate")) e.innerText = main;
+  if(e = document.getElementById("i_pat")) e.innerText = at;
+  if(e = document.getElementById("i_pcode")) e.innerHTML = meta;
+}
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){return({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"})[c];});}
 
 /* ---- 运行时长：页面本地每秒自增，不依赖服务端轮询 ---- */
@@ -1857,11 +2338,11 @@ function showDay(date){
            + '<span class="bt">' + fmtBytes(s.bytes) + '</span></div>';
     }).join("");
     box.innerHTML = '<div class="ddhead"><b>' + esc(d.date) + ' 打印明细</b>'
-      + '<span class="ddsum">总计 <em>' + d.total + '</em> 次 · 成功 ' + d.ok + ' · '
+      + '<span class="ddsum">总计 <em>' + d.total + '</em> 次 · 成功 ' + (d.succ || 0) + ' · '
       + (d.fail ? '<span class="fl">失败 ' + d.fail + '</span>' : '失败 0') + ' · 数据 ' + fmtBytes(d.bytes) + '</span>'
       + '<button class="ddclose" onclick="closeDay()">收起</button></div>'
-      + '<div class="ddlist">' + (rows || '<div class="ddempty">当天没有来源记录</div>') + '</div>'
-      + (d.fallback ? '<div class="ddempty" style="margin-top:8px">来源分布由最近 %JOB_KEEP% 条任务记录推算（分来源统计从本版本开始累计）</div>' : "");
+      + '<div class="ddlist">' + (rows || '<div class="ddempty">' + (d.total ? '当天没有来源记录' : '当天没有打印记录') + '</div>') + '</div>'
+      + (d.fallback && d.total ? '<div class="ddempty" style="margin-top:8px">来源分布由最近 %JOB_KEEP% 条任务记录推算（分来源统计从本版本开始累计）</div>' : "");
   }).catch(function(){ box.innerHTML = '<div class="ddempty">读取失败</div>'; });
 }
 
@@ -1880,10 +2361,15 @@ function loadStats(force){
   var days = document.getElementById("statDays").value || "14";
   fetch("/api/stats?days=" + days).then(function(r){return r.json();}).then(function(d){
     var max = Math.max(1, d.max || 1);
-    var list = d.days || [];
+    var list = d.days || [];        // 服务端已按所选天数补齐占位，前端直接画
     var html = "";
     for(var i=0;i<list.length;i++){
-      var it = list[i], ok = it.ok || 0, fail = it.fail || 0;
+      var it = list[i];
+      if(it.empty){   // 占位日：只显示日期，没有柱子
+        html += '<div class="col ph"><div class="bars"></div><div class="dt">' + it.date + '</div></div>';
+        continue;
+      }
+      var ok = it.ok || 0, fail = it.fail || 0;
       var hOk = Math.round(ok / max * 130), hFail = Math.round(fail / max * 130);
       if(ok > 0 && hOk < 3) hOk = 3;
       if(fail > 0 && hFail < 3) hFail = 3;
@@ -1896,6 +2382,10 @@ function loadStats(force){
     var box = document.getElementById("chart");
     if(box){
       box.innerHTML = html || '<div class="empty">暂无打印数据</div>';
+      // 窄屏放不下时默认滚动到中间，让数据落在可视区中央
+      if(box.scrollWidth > box.clientWidth){
+        box.scrollLeft = Math.round((box.scrollWidth - box.clientWidth) / 2);
+      }
       if(!box.__dayBound){
         box.__dayBound = true;
         box.addEventListener("click", function(e){
@@ -1913,8 +2403,8 @@ function loadStats(force){
   }).catch(function(){});
 }
 
-var JOB_PAGE_SIZES = [10, 20, 30, 50, 100];
-var jobPageSize = 10, jobCache = [], jobPageNo = 0;
+var JOB_PAGE_SIZES = [5, 10, 20, 30, 50, 100];
+var jobPageSize = 5, jobCache = [], jobPageNo = 0;
 
 try{
   var _sz = parseInt(localStorage.getItem("job_page_size"), 10);
@@ -1923,7 +2413,7 @@ try{
 
 function setJobPageSize(v){
   var n = parseInt(v, 10);
-  if(JOB_PAGE_SIZES.indexOf(n) < 0) n = 10;
+  if(JOB_PAGE_SIZES.indexOf(n) < 0) n = 5;
   jobPageSize = n;
   jobPageNo = 0;
   try{ localStorage.setItem("job_page_size", String(n)); }catch(e){}
@@ -1953,7 +2443,7 @@ function renderJobs(){
     body.innerHTML = html;
   }
   var info = document.getElementById("jobpageinfo");
-  if(info) info.innerText = "第 " + (jobPageNo + 1) + " / " + pages + " 页 · 共 " + total + " 条（每页 " + jobPageSize + " 条）";
+  if(info) info.innerText = "第 " + (jobPageNo + 1) + " / " + pages + " 页 · 共 " + total + " 条";
   var prev = document.getElementById("jobprev"), next = document.getElementById("jobnext");
   if(prev) prev.disabled = jobPageNo <= 0;
   if(next) next.disabled = jobPageNo >= pages - 1;
@@ -1967,7 +2457,12 @@ function jobPage(delta){
 function refresh(){
   fetch("/api/status").then(function(r){return r.json();}).then(function(d){
     setText("s_usb", d.usb_online ? "已连接" : "未连接");
+    var ud = document.getElementById("s_usbdot");
+    if(ud) ud.className = "svcdot " + (d.usb_online ? "ok" : "bad");
+    setText("i_connmeta", d.usb_online ? ("USB 直连 · 共享端口 9100 · " + (d.printer_name || "已识别设备")) : "USB 直连 · 共享端口 9100 · 等待设备接入");
     setText("s_port", d.port_listening ? "监听中" : "未启动");
+    var pd = document.getElementById("s_portdot");
+    if(pd) pd.className = "svcdot " + (d.port_listening ? "ok" : "bad");
     setText("s_jobs", d.jobs);
     setText("s_bytes", fmtBytes(d.bytes));
     setText("s_src", d.source_count);
@@ -1986,11 +2481,12 @@ function refresh(){
     setText("i_lasttime", d.last_job_time || "--");
     setText("i_lastsize", d.last_job_size ? fmtBytes(d.last_job_size) : "--");
     setText("devid", d.printer_id || "--");
+    paintPstatus(d.printer_status);
 
-    var pill=document.getElementById("pill"), pilltext=document.getElementById("pilltext");
-    if(d.usb_online && d.port_listening){pill.className="pill ok";pilltext.innerText="运行正常";}
-    else if(d.usb_online){pill.className="pill warn";pilltext.innerText="打印机就绪，服务异常";}
-    else {pill.className="pill bad";pilltext.innerText="打印机未连接";}
+    var pill=document.getElementById("svcconn"), pilltext=document.getElementById("svc_main"), svcdot=document.getElementById("svc_dot");
+    if(d.usb_online && d.port_listening){pill.className="svcstate ok";svcdot.className="svcdot ok";pilltext.innerText="运行正常";}
+    else if(d.usb_online){pill.className="svcstate warn";svcdot.className="svcdot warn";pilltext.innerText="打印机就绪，服务异常";}
+    else {pill.className="svcstate bad";svcdot.className="svcdot bad";pilltext.innerText="打印机未连接";}
   }).catch(function(){});
 
   fetch("/api/jobs").then(function(r){return r.json();}).then(function(d){
@@ -2041,20 +2537,8 @@ function reconnect(){
 function restartPanel(){
   if(!confirm("确定重启打印服务？约 2~3 秒内面板无法访问，正在打印的任务会中断。")) return;
   fetch("/api/restart",{method:"POST"}).then(function(){
-    setText("pilltext", "正在重启…");
     setTimeout(function(){ location.reload(); }, 4000);
   }).catch(function(){ setTimeout(function(){ location.reload(); }, 3000); });
-}
-
-function testpage(){
-  fetch("/api/test",{method:"POST"}).then(function(){refresh();});
-}
-
-function pushtest(){
-  fetch("/api/push_test",{method:"POST"}).then(function(r){return r.json();}).then(function(d){
-    alert(d.msg || (d.ok ? "推送已发送" : "推送失败"));
-    refresh();
-  });
 }
 
 function toggleAuto(){
@@ -2072,9 +2556,25 @@ document.addEventListener("visibilitychange", function(){ if(!document.hidden) l
 // 页面从后台回到前台时补一次状态
 document.addEventListener("visibilitychange", function(){ if(!document.hidden && autoRefresh) refresh(); });
 
+function onStatDays(v){
+  try{ localStorage.setItem("stat_days", String(v)); }catch(e){}
+  loadStats(true);
+}
+
+// 手机窄屏默认近 7 天，PC 默认近 14 天；用户手动切换过就记住上次选择
+function initStatDays(){
+  var sel = document.getElementById("statDays");
+  if(!sel) return;
+  var saved = null;
+  try{ saved = localStorage.getItem("stat_days"); }catch(e){}
+  if(saved && ["7", "14", "30"].indexOf(String(saved)) >= 0){ sel.value = String(saved); return; }
+  var narrow = window.matchMedia ? window.matchMedia("(max-width: 700px)").matches : (window.innerWidth <= 700);
+  sel.value = narrow ? "7" : "14";
+}
+
+initStatDays();
 initJobSize();
 refresh();
-loadStats(true);
 loadNotes();
 setInterval(loadNotes, 30000);
 startTimer();
@@ -2093,10 +2593,10 @@ SETTINGS_CSS = """
 body{background:var(--bg);font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;color:var(--txt);padding:22px 16px 60px}
 .wrap{max-width:820px;margin:0 auto}
 .bar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:16px}
-.back,.out{font-size:13px;color:var(--brand);text-decoration:none;white-space:nowrap}
-.back:hover,.out:hover{text-decoration:underline}
-.nav{display:flex;gap:8px;flex-wrap:wrap}
-.nav a{font-size:13px;color:var(--sub);text-decoration:none;padding:7px 13px;border:1px solid var(--line);border-radius:9px;background:#fff}
+.back{font-size:13px;color:var(--brand);text-decoration:none;white-space:nowrap;flex:none}
+.back:hover{text-decoration:underline}
+.nav{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;flex:1;min-width:0}
+.nav a{text-align:center;font-size:13px;color:var(--sub);text-decoration:none;padding:7px 8px;border:1px solid var(--line);border-radius:9px;background:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .nav a.on{color:#fff;background:var(--brand);border-color:var(--brand);font-weight:600}
 .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px 20px;box-shadow:0 8px 24px rgba(20,40,70,.06)}
 h2{font-size:17px;font-weight:600;margin-bottom:6px}
@@ -2134,16 +2634,50 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
 .msg.bad{color:var(--bad)}
 .btns{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:18px}
 .note{font-size:12px;color:var(--sub);line-height:1.75;background:#f7fafc;border:1px solid var(--line);border-radius:10px;padding:11px 13px;margin-top:18px}
+.setlist{display:flex;flex-direction:column;gap:10px}
+.setrow{display:flex;align-items:center;gap:13px;padding:14px 15px;border:1px solid var(--line);border-radius:13px;background:#fcfdfe;text-decoration:none;color:var(--txt);transition:background .15s,border-color .15s,transform .12s}
+.setrow:hover{background:#f4f9ff;border-color:#cfe2ff;transform:translateX(2px)}
+.setrow:active{transform:scale(.995)}
+.setic{flex:none;width:36px;height:36px;border-radius:10px;background:#eef4fc;display:flex;align-items:center;justify-content:center;font-size:17px}
+.setinfo{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.setinfo b{font-size:14.5px;font-weight:600}
+.setinfo span{font-size:12px;color:var(--sub);line-height:1.6}
+.setgo{flex:none;color:#b6c1cc;font-size:20px;line-height:1}
+@media (max-width:560px){.bar{gap:8px}.nav{gap:6px}.nav a{padding:7px 4px;font-size:11.5px}}
 """
 
 SETTINGS_PATH_ROWS = [("设备设置", "/device"), ("来源备注", "/notes"), ("数据管理", "/data"), ("推送配置", "/push"), ("修改密码", "/password")]
 
+SETTINGS_INDEX_ICON = {"设备设置": "⚙", "来源备注": "🏷", "数据管理": "📊", "推送配置": "🔔", "修改密码": "🔑"}
+
+SETTINGS_INDEX_DESC = {
+    "设备设置": "选择要共享的 USB 打印机设备，保存后立即重连。",
+    "来源备注": "给常用来源 IP 起名字，任务列表里直接显示“办公室”“老板电脑”等。",
+    "数据管理": "调整打印监控保留条数，清理累计任务与累计数据。",
+    "推送配置": "配置 Pushplus 推送渠道与触发条件，可发一条测试推送。",
+    "修改密码": "更换面板访问密码，改完旧会话会失效。",
+}
+
+
+def settings_index_body():
+    rows = ""
+    for label, href in SETTINGS_PATH_ROWS:
+        rows += ('<a class="setrow" href="%s"><span class="setic">%s</span>'
+                 '<span class="setinfo"><b>%s</b><span>%s</span></span>'
+                 '<span class="setgo">›</span></a>') % (
+                     href, SETTINGS_INDEX_ICON.get(label, "•"), label,
+                     SETTINGS_INDEX_DESC.get(label, ""))
+    return '<div class="desc">面板的所有配置都在这里，点进去按需修改。</div><div class="setlist">%s</div>' % rows
+
 
 def settings_page(title, active, body, script=""):
     nav = ""
-    for label, href in SETTINGS_PATH_ROWS:
-        cls = ' class="on"' if label == active else ""
-        nav += '<a%s href="%s">%s</a>' % (cls, href, label)
+    if active:
+        links = ""
+        for label, href in SETTINGS_PATH_ROWS:
+            cls = ' class="on"' if label == active else ""
+            links += '<a%s href="%s">%s</a>' % (cls, href, label)
+        nav = '<div class="nav">%s</div>' % links
     html = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2156,8 +2690,7 @@ def settings_page(title, active, body, script=""):
 <div class="wrap">
   <div class="bar">
     <a class="back" href="/">← 返回面板</a>
-    <div class="nav">%NAV%</div>
-    <a class="out" href="/logout">退出登录</a>
+    %NAV%
   </div>
   <div class="card">
     <h2>%TITLE%</h2>
@@ -2567,7 +3100,7 @@ def client_ip():
 @app.before_request
 def require_login():
     path = request.path
-    if path in ("/favicon.ico", "/robots.txt", "/license"):
+    if path in ("/favicon.ico", "/robots.txt", "/license", "/healthz"):
         return None
 
     ready = auth_ready()
@@ -2588,6 +3121,12 @@ def require_login():
     if path.startswith("/api/"):
         return jsonify({"ok": False, "msg": "未登录"}), 401
     return redirect("/login")
+
+
+@app.route("/healthz")
+def healthz():
+    """容器健康检查用：不登录、不读 USB，只证明面板进程还活着。"""
+    return jsonify({"ok": True, "uptime": int(time.time() - START_TS)})
 
 
 @app.route("/setup", methods=["GET", "POST"])
@@ -2718,6 +3257,11 @@ def index():
 def page_device():
     body = DEVICE_BODY.replace("%CUR%", PRINTER_ID)
     return Response(settings_page("设备设置", "设备设置", body, DEVICE_SCRIPT), mimetype="text/html")
+
+
+@app.route("/settings")
+def page_settings():
+    return Response(settings_page("设置", "", settings_index_body()), mimetype="text/html")
 
 
 @app.route("/push")
@@ -2921,6 +3465,9 @@ def api_status():
     data["push_topic"] = conf.get("topic", "")
     data["push_job_fail"] = bool(conf.get("job_fail_push"))
     data["offline_alert_sec"] = int(conf.get("offline_alert_sec") or 60)
+    st = printer_status_snapshot()
+    st["main"] = printer_status_text()
+    data["printer_status"] = st
     return jsonify(data)
 
 
@@ -2984,9 +3531,24 @@ def api_stats():
 
     out = []
     today = datetime.date.today()
+    window_start = today - datetime.timedelta(days=days - 1)
     with stats_lock:
         snapshot = dict(daily_stats)
-    for i in range(days - 1, -1, -1):
+    # 起点对齐到窗口内第一条有数据的那天，前面没有数据的空日期不再画出来
+    earliest = None
+    for k, v in snapshot.items():
+        try:
+            d = datetime.datetime.strptime(k, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        n = int(v.get("ok", 0) or 0) + int(v.get("fail", 0) or 0)
+        if n <= 0 or d > today or d < window_start:
+            continue
+        if earliest is None or d < earliest:
+            earliest = d
+    start = earliest if earliest is not None else window_start
+    span = (today - start).days + 1
+    for i in range(span - 1, -1, -1):
         day = today - datetime.timedelta(days=i)
         key = day.strftime("%Y-%m-%d")
         item = snapshot.get(key) or {}
@@ -2999,7 +3561,22 @@ def api_stats():
         })
     today_key = today.strftime("%Y-%m-%d")
     today_item = snapshot.get(today_key) or {}
-    total_bytes = sum(int(v.get("bytes", 0) or 0) for v in snapshot.values())
+    # 补齐到所选天数：有数据的这段居中，前后用带日期的空位占着（空位只显示日期，不画柱子）
+    if len(out) < days:
+        pad = days - len(out)
+        pad_l = pad // 2
+        pad_r = pad - pad_l
+        left = []
+        for i in range(pad_l, 0, -1):
+            day = start - datetime.timedelta(days=i)
+            left.append({"date": day.strftime("%m-%d"), "date_full": day.strftime("%Y-%m-%d"),
+                         "ok": 0, "fail": 0, "bytes": 0, "empty": True})
+        right = []
+        for i in range(1, pad_r + 1):
+            day = today + datetime.timedelta(days=i)
+            right.append({"date": day.strftime("%m-%d"), "date_full": day.strftime("%Y-%m-%d"),
+                          "ok": 0, "fail": 0, "bytes": 0, "empty": True})
+        out = left + out + right
     return jsonify({
         "days": out,
         "max": max([d["ok"] + d["fail"] for d in out] + [1]),
@@ -3008,7 +3585,6 @@ def api_stats():
             "fail": int(today_item.get("fail", 0) or 0),
             "bytes": int(today_item.get("bytes", 0) or 0),
         },
-        "total_bytes": total_bytes,
     })
 
 
@@ -3078,7 +3654,7 @@ def api_day():
         "ok": True,
         "date": key,
         "total": ok_n + fail_n,
-        "ok": ok_n,
+        "succ": ok_n,
         "fail": fail_n,
         "bytes": bytes_n,
         "sources": sources,
@@ -3147,21 +3723,24 @@ def api_save_config():
 
     if isinstance(body.get("push"), dict):
         p = body["push"]
+        # 先校验渠道，再写配置：避免中途报错留下改了一半的状态
+        picked = None
+        if "channel" in p:
+            val = p["channel"]
+            if isinstance(val, (list, tuple)):
+                picked = [str(x).strip() for x in val if str(x).strip()]
+            else:
+                picked = [x.strip() for x in str(val).split(",") if x.strip()]
+            invalid = [x for x in picked if x not in ALL_CHANNELS]
+            if invalid:
+                return jsonify({"ok": False, "msg": "不支持的渠道：%s" % ",".join(invalid)})
+            if not picked:
+                return jsonify({"ok": False, "msg": "请至少选择一个推送渠道"})
         with cfg_lock:
             conf = CFG.setdefault("push", {})
             if "token" in p:
                 conf["token"] = str(p["token"]).strip()
-            if "channel" in p:
-                val = p["channel"]
-                if isinstance(val, (list, tuple)):
-                    picked = [str(x).strip() for x in val if str(x).strip()]
-                else:
-                    picked = [x.strip() for x in str(val).split(",") if x.strip()]
-                invalid = [x for x in picked if x not in ALL_CHANNELS]
-                if invalid:
-                    return jsonify({"ok": False, "msg": "不支持的渠道：%s" % ",".join(invalid)})
-                if not picked:
-                    return jsonify({"ok": False, "msg": "请至少选择一个推送渠道"})
+            if picked is not None:
                 conf["channel"] = ",".join(picked)
             if "option" in p:
                 conf["option"] = str(p["option"]).strip()
@@ -3236,47 +3815,16 @@ def api_restart():
     return jsonify({"ok": True, "msg": "服务正在重启，约 2~3 秒后恢复"})
 
 
-@app.route("/api/test", methods=["POST"])
-def api_test():
-    if not printer.is_ready() and not printer.connect(silent=True):
-        set_state(last_error="打印机未连接")
-        return jsonify({"ok": False, "msg": "打印机未连接"})
-    content = (
-        b"\x1bE"
-        b"====================\r\n"
-        b"  USB Print Bridge Test Page\r\n"
-        b"====================\r\n\r\n"
-        b"Device : " + (state["printer_name"] or "USB Printer").encode("utf-8", "ignore") + b"\r\n"
-        b"USB ID : " + PRINTER_ID.encode("utf-8") + b"\r\n"
-        b"Port   : 9100\r\n\r\n"
-        + time.strftime("%Y-%m-%d %H:%M:%S").encode("utf-8") + b"\r\n\r\n"
-        b"Print OK.\r\n\x0c"
-    )
-    try:
-        printer.write(content)
-        with lock:
-            state["jobs"] += 1
-            state["bytes"] += len(content)
-            state["last_job_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            state["last_job_size"] = len(content)
-            state["last_job_ok"] = True
-        save_totals()
-        log("测试页已发送（%d 字节）" % len(content))
-        return jsonify({"ok": True})
-    except Exception as exc:
-        set_state(last_error=str(exc), last_job_ok=False)
-        log("测试页发送失败：%s" % exc)
-        return jsonify({"ok": False, "msg": str(exc)})
-
-
 @app.route("/api/push_test", methods=["POST"])
 def api_push_test():
+    with lock:
+        st = dict(state)
     ok, msg = do_push(
         "推送测试",
         push_html([
             "<b>USB 打印服务：推送测试</b>",
-            "设备：%s（%s）" % (state["printer_name"] or "USB 打印机", PRINTER_ID),
-            "打印机状态：%s" % ("在线" if state["usb_online"] else "离线"),
+            "设备：%s（%s）" % (st.get("printer_name") or "USB 打印机", PRINTER_ID),
+            "打印机状态：%s" % ("在线" if st.get("usb_online") else "离线"),
             "渠道：%s" % push_conf().get("channel", ""),
             "时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"),
         ]),
