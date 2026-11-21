@@ -24,6 +24,9 @@ services:
       - ./panel.py:/app/panel.py:ro
     environment:
       - TZ=Asia/Shanghai
+      # host 模式下端口就是 NAS 的 9100 / 8910；被占用时改这两行
+      # - WEB_PORT=8911
+      # - PRINT_PORT=9101
       # 注意：这里不再配置账号密码。
       # 第一次打开 http://NAS的IP:8910 时，页面会让你自己设置一个访问密码（只有密码，没有用户名），
       # 密码只以哈希形式存在 ./data/config.json 里，不会出现在环境变量或日志中。

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/meyzh/p910nd-panel/refs/heads/main/logo.svg" width="220" alt="p910nd-panel logo">
+</p>
+
 # 🖨️ p910nd-panel
 
 ![](https://raw.githubusercontent.com/meyzh/p910nd-panel/refs/heads/main/img.png)
@@ -80,7 +84,7 @@ docker compose up -d
 
 不知道 NAS IP 时，三个地方都能查到：`docker compose logs` 启动日志会打印「面板地址 / 打印端口」两行；面板「设置中心」首页有一条「访问地址」；也可以在 NAS 本机 `ip a` 或 `hostname -I` 看。
 
-如果 8910 被飞牛上的其他服务占用，容器会启动失败，改 `environment` 里的 `WEB_PORT`（如 `8911`）即可，面板地址随之变化，9100 不受影响。
+如果 8910 或 9100 已被飞牛上的其他服务占用，改 `environment` 里的 `WEB_PORT` / `PRINT_PORT`（如 `8911` / `9101`）即可，两个端口都支持。启动日志会明确写出哪个端口绑定失败、该改哪个变量，不会只丢一个 Traceback。换了打印端口后，客户端添加打印机时填新端口。
 
 ### 方式二：从源码构建
 
@@ -214,9 +218,9 @@ API：`/healthz` `/api/status` `/api/log` `/api/jobs` `/api/jobs/clear` `/api/st
 
 ## 📜 许可与声明
 
-本项目**仅允许非商业使用**，完整条款见 [LICENSE](LICENSE)。
+本项目**仅允许非商业使用**，完整条款见 [LICENSE](https://github.com/meyzh/p910nd-panel/blob/main/LICENSE)。
 
-- 🚫 **禁止商用**：未经作者书面许可，不得将本项目或其核心功能用于销售、付费部署、SaaS 租赁、预装售卖、收费服务等任何商业用途。商业授权请通过项目地址 [https://github.com/meyzh/p910nd-panel](https://github.com/meyzh/p910nd-panel) 联系作者。
+- 🚫 **禁止商用**：未经作者书面许可，不得将本项目或其核心功能用于销售、付费部署、SaaS 租赁、预装售卖、收费服务等任何商业用途。商业授权请通过项目地址 [https://github.com/meyzh/p910nd-panel](https://github.com/meyzh/p910nd-panel) 或邮箱 [me@godr.cn](mailto:me@godr.cn) 联系作者。
 - ©️ **版权必须保留**：二次开发、修改、衍生版本在分发或对外提供时，必须完整保留 `LICENSE` 与原作者版权声明，保留网页界面底部的版权信息（`© 亦桉` 及指向 [https://www.godr.cn/](https://www.godr.cn/) 的链接），并在显著位置注明「基于 p910nd-panel（https://github.com/meyzh/p910nd-panel）修改」。
 - 📌 **不得改许可**：衍生作品继续受本许可约束，不能单方面改为 MIT / Apache-2.0 等更宽松的许可。
 - ❌ **不得冒名**：不得以原作者名义宣传，或暗示原作者为衍生作品背书。
