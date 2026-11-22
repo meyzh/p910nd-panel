@@ -31,7 +31,7 @@ services:
       # 第一次打开 http://NAS的IP:8910 时，页面会让你自己设置一个访问密码（只有密码，没有用户名），
       # 密码只以哈希形式存在 ./data/config.json 里，不会出现在环境变量或日志中。
       # ---- 首次启动的默认打印设备 ID，之后在网页「设备设置」里改 ----
-      - PRINTER_ID=0482:0d44
+      - PRINTER_ID=
       # ---- 首次启动的默认推送参数，之后统一在网页「推送配置」里改 ----
       - PUSHPLUS_TOKEN=
       - PUSHPLUS_CHANNEL=wechat
