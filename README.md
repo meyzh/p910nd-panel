@@ -86,6 +86,15 @@ docker compose up -d
 
 如果 8910 或 9100 已被飞牛上的其他服务占用，改 `environment` 里的 `WEB_PORT` / `PRINT_PORT`（如 `8911` / `9101`）即可，两个端口都支持。启动日志会明确写出哪个端口绑定失败、该改哪个变量，不会只丢一个 Traceback。换了打印端口后，客户端添加打印机时填新端口。
 
+### 首次打开：先设密码，再选打印机
+
+程序不预置任何打印机型号，换一台机器部署不会带着别处的设备 ID。第一次打开 `http://NAS的IP:8910`：
+
+1. 按提示设置面板访问密码
+2. 进「设置中心 → 设备设置」，点「扫描 USB 设备」，选中目标打印机后保存
+
+没配之前面板会标「未配置打印机」，端口照常监听但收到任务会直接失败并提示先去配置。
+
 ### 方式二：从源码构建
 
 ```bash
@@ -221,7 +230,7 @@ API：`/healthz` `/api/status` `/api/log` `/api/jobs` `/api/jobs/clear` `/api/st
 本项目**仅允许非商业使用**，完整条款见 [LICENSE](https://github.com/meyzh/p910nd-panel/blob/main/LICENSE)。
 
 - 🚫 **禁止商用**：未经作者书面许可，不得将本项目或其核心功能用于销售、付费部署、SaaS 租赁、预装售卖、收费服务等任何商业用途。商业授权请通过项目地址 [https://github.com/meyzh/p910nd-panel](https://github.com/meyzh/p910nd-panel) 或邮箱 [me@godr.cn](mailto:me@godr.cn) 联系作者。
-- ©️ **版权必须保留**：二次开发、修改、衍生版本在分发或对外提供时，必须完整保留 `LICENSE` 与原作者版权声明，保留网页界面底部的版权信息（`© 亦桉` 及指向 [https://www.godr.cn/](https://www.godr.cn/) 的链接），并在显著位置注明「基于 [p910nd-panel](https://github.com/meyzh/p910nd-panel) 修改」。
+- ©️ **版权必须保留**：二次开发、修改、衍生版本在分发或对外提供时，必须完整保留 `LICENSE` 与原作者版权声明，保留网页界面底部的版权信息（`© 亦桉` 及指向 [https://www.godr.cn/](https://www.godr.cn/) 的链接），并在显著位置注明「基于 p910nd-panel（https://github.com/meyzh/p910nd-panel）修改」。
 - 📌 **不得改许可**：衍生作品继续受本许可约束，不能单方面改为 MIT / Apache-2.0 等更宽松的许可。
 - ❌ **不得冒名**：不得以原作者名义宣传，或暗示原作者为衍生作品背书。
 

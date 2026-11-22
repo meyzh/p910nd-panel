@@ -39,10 +39,13 @@ except Exception as exc:
     PYUSB_ERROR = str(exc)
 
 # ==================== 基础配置 ====================
-VID = 0x0482
-PID = 0x0D44
-DEFAULT_DEVICE_ID = "0482:0d44"
+# 打印机 USB ID 不预置任何具体型号：换一台机器部署时，这里不会带着别人的打印机，
+# 装好后在网页「设备设置」页扫描 USB 设备（或手动填 vid:pid）再保存即可。
+VID = None
+PID = None
+DEFAULT_DEVICE_ID = ""
 PRINTER_ID = DEFAULT_DEVICE_ID
+DEVICE_ID_SAMPLE = "1234:5678"   # 界面/文档里的格式示例，不是真实设备
 PROJECT_URL = "https://github.com/meyzh/p910nd-panel"   # 项目主页，页脚 GitHub 图标指向这里
 def _env_port(name, default):
     """端口可用环境变量覆盖：host 模式下端口被别的东西占用时改这里"""
@@ -227,7 +230,8 @@ def build_default_config():
         "version": 2,
         "secret_key": os.urandom(24).hex(),
         "device": {
-            "id": (os.environ.get("PRINTER_ID", DEFAULT_DEVICE_ID).strip() or DEFAULT_DEVICE_ID),
+            # 留空 = 未配置，首次上线后到「设备设置」页扫描或手填
+            "id": os.environ.get("PRINTER_ID", "").strip(),
         },
         # 不再预置账号密码：首次打开网页时由使用者自己设置，且只存哈希
         "auth": {
@@ -369,7 +373,7 @@ HEX_CHARS = "0123456789abcdef"
 
 
 def parse_device_id(text):
-    """解析设备 ID：支持 0482:0d44 / 0482-0d44 / 0x0482:0x0d44 / 04820d44"""
+    """解析设备 ID：支持 1234:5678 / 1234-5678 / 0x1234:0x5678 / 12345678"""
     raw = str(text or "").strip().lower().replace("0x", "")
     for sep in (":", "-", "_", "/", ".", " ", ",", "|"):
         raw = raw.replace(sep, "")
@@ -387,14 +391,26 @@ def parse_device_id(text):
 
 
 def apply_device_id(dev_id):
-    """把设备 ID 应用到全局（改动后 USB 查找立即按新 ID 走）"""
+    """把设备 ID 应用到全局（改动后 USB 查找立即按新 ID 走）
+
+    传空字符串表示“清空设备配置”，此时不猜任何型号，USB 查找直接跳过。
+    """
     global VID, PID, PRINTER_ID
-    parsed = parse_device_id(dev_id)
+    text = str(dev_id or "").strip()
+    if not text:
+        VID, PID, PRINTER_ID = None, None, ""
+        return True
+    parsed = parse_device_id(text)
     if not parsed:
         return False
     VID, PID, norm = parsed
     PRINTER_ID = norm
     return True
+
+
+def device_label():
+    """界面上显示用的设备标识，未配置时给一句人话而不是空白。"""
+    return PRINTER_ID or "未配置"
 
 
 def device_conf():
@@ -823,7 +839,7 @@ class UsbPrinter(object):
         self._status_at = 0.0
 
     def _find_dev(self):
-        if not PYUSB_OK:
+        if not PYUSB_OK or not PRINTER_ID or VID is None or PID is None:
             return None
         try:
             # 每次查找都新建一个 libusb backend，等价于新建 libusb 上下文：
@@ -912,6 +928,8 @@ class UsbPrinter(object):
 
     def diag(self):
         """把 USB 现场信息整理成若干行日志，用来自查连不上的原因。"""
+        if not PRINTER_ID:
+            return ["尚未设置打印机 ID：请打开面板「设备设置」页，点“扫描 USB 设备”选中后保存"]
         out = ["目标设备 ID：%s" % PRINTER_ID]
         if not PYUSB_OK:
             out.append("pyusb 不可用：%s" % PYUSB_ERROR)
@@ -1003,6 +1021,8 @@ class UsbPrinter(object):
         return False
 
     def sysfs_present(self):
+        if not PRINTER_ID or VID is None or PID is None:
+            return None
         return self._sysfs_present(VID, PID)
 
     @staticmethod
@@ -1197,12 +1217,17 @@ class UsbPrinter(object):
     def connect(self, dev=None, silent=False):
         with self.io_lock:
             self._close()
+            if not PRINTER_ID:
+                # 还没配置打印机：不猜任何型号，直接把状态说明写清楚
+                set_state(usb_online=False, printer_name="", usb_bus="", usb_addr="",
+                          usb_speed="", last_error="尚未设置打印机 ID")
+                return False
             for attempt in (0, 1):
                 cur = dev or self._find_dev()
                 if cur is None:
                     set_state(usb_online=False, printer_name="", usb_bus="", usb_addr="", usb_speed="")
                     if not silent:
-                        log("未检测到打印机 %s" % PRINTER_ID)
+                        log("未检测到打印机 %s" % device_label())
                     return False
                 if self._open_once(cur, silent=silent):
                     return True
@@ -1222,7 +1247,7 @@ class UsbPrinter(object):
                 usb_bus="",
                 usb_addr="",
                 usb_speed="",
-                last_error="USB 设备无法连接（%s）" % PRINTER_ID,
+                last_error="USB 设备无法连接（%s）" % device_label(),
             )
             return False
 
@@ -1739,7 +1764,7 @@ def notify_job_fail(peer, err, size):
         "打印任务失败",
         push_html([
             "<b>USB 打印服务：打印任务失败</b>",
-            "设备：%s（%s）" % (state["printer_name"] or "USB 打印机", PRINTER_ID),
+            "设备：%s（%s）" % (state["printer_name"] or "USB 打印机", device_label()),
             "来源：%s" % peer,
             "已传输：%s" % fmt_bytes(size),
             "原因：%s" % err,
@@ -1776,6 +1801,8 @@ def handle_job(conn, addr):
     job_lock.acquire()
     try:
         # 设备已从系统里消失时立刻失败，别让客户端干等十几秒的 USB 超时
+        if not PRINTER_ID:
+            raise RuntimeError("尚未设置打印机 ID，请先在面板「设备设置」页扫描并保存")
         if printer.sysfs_present() is False:
             raise RuntimeError("打印机已拔出（USB 设备不在系统中）")
         if not printer.is_ready():
@@ -1915,7 +1942,27 @@ def watcher_loop():
         log("pyusb 不可用（%s），USB 打印功能无法启用" % PYUSB_ERROR)
 
     present_prev = None      # 上一轮 sysfs 里是否看得到设备，用来识别“刚被拔掉”
+    no_id_logged = False
     while True:
+        if not PRINTER_ID:
+            # 没配打印机：什么都不连、不推送离线，只把状态写成人能看懂的一句话
+            if not no_id_logged:
+                no_id_logged = True
+                log("尚未设置打印机 ID：打开面板「设备设置」页扫描 USB 设备并保存；"
+                    "配置好之前不会尝试连接任何设备")
+            offline_since = None
+            offline_alerted = False
+            connect_fail_streak = 0
+            with lock:
+                need_reset = (bool(state["usb_online"]) or bool(state["printer_name"])
+                              or state.get("last_error") != "尚未设置打印机 ID")
+            if need_reset:
+                printer.disconnect()
+                set_state(usb_online=False, printer_name="", usb_bus="", usb_addr="",
+                          usb_speed="", last_error="尚未设置打印机 ID")
+            time.sleep(3)
+            continue
+        no_id_logged = False
         dev = None
         present = None
         try:
@@ -1929,7 +1976,7 @@ def watcher_loop():
 
         just_vanished = (present is False and present_prev is True)
         if just_vanished:
-            log("打印机已拔出：USB 设备已从系统移除（%s）" % PRINTER_ID)
+            log("打印机已拔出：USB 设备已从系统移除（%s）" % device_label())
         present_prev = present
 
         try:
@@ -1948,10 +1995,10 @@ def watcher_loop():
                         usb_bus="",
                         usb_addr="",
                         usb_speed="",
-                        last_error="未检测到打印机（%s）" % PRINTER_ID,
+                        last_error="未检测到打印机（%s）" % device_label(),
                     )
                     if not just_vanished:
-                        log("打印机已断开：未检测到 %s，等待重新插入" % PRINTER_ID)
+                        log("打印机已断开：未检测到 %s，等待重新插入" % device_label())
                 if offline_since is None:
                     offline_since = time.time()
                 if (not offline_alerted) and push_ready() and (time.time() - offline_since) >= alert_sec:
@@ -1960,7 +2007,7 @@ def watcher_loop():
                         "打印机离线",
                         push_html([
                             "<b>USB 打印服务：打印机离线</b>",
-                            "设备：%s" % PRINTER_ID,
+                            "设备：%s" % device_label(),
                             "状态：已持续离线 %d 秒，无法打印" % int(time.time() - offline_since),
                             "检查：USB 线是否松动 / 打印机是否断电 / 是否被其他程序占用",
                             "时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1972,7 +2019,7 @@ def watcher_loop():
                         "打印机已恢复",
                         push_html([
                             "<b>USB 打印服务：打印机已恢复</b>",
-                            "设备：%s（%s）" % ((printer._get_product(dev) or "USB 打印机"), PRINTER_ID),
+                            "设备：%s（%s）" % ((printer._get_product(dev) or "USB 打印机"), device_label()),
                             "状态：已重新连接，可以正常打印",
                             "时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"),
                         ]),
@@ -2687,7 +2734,7 @@ function refresh(){
     setText("s_jobs", d.jobs);
     setText("s_bytes", fmtBytes(d.bytes));
     setText("s_src", d.source_count);
-    setText("i_name", d.printer_name || "--");
+    setText("i_name", d.printer_name || (d.printer_id ? "--" : "未配置"));
     setText("i_bus", d.usb_online ? (d.usb_bus + " / " + d.usb_addr) : "--");
     setText("i_speed", d.usb_speed || "--");
     if(d.uptime_sec!=null){
@@ -2701,12 +2748,13 @@ function refresh(){
     setText("i_reconnects", d.reconnects);
     setText("i_lasttime", d.last_job_time || "--");
     setText("i_lastsize", d.last_job_size ? fmtBytes(d.last_job_size) : "--");
-    setText("devid", d.printer_id || "--");
+    setText("devid", d.printer_id || "未配置");
     paintPstatus(d.printer_status);
 
     var pill=document.getElementById("svcconn"), pilltext=document.getElementById("svc_main"), svcdot=document.getElementById("svc_dot");
     if(d.usb_online && d.port_listening){pill.className="svcstate ok";svcdot.className="svcdot ok";pilltext.innerText="运行正常";}
     else if(d.usb_online){pill.className="svcstate warn";svcdot.className="svcdot warn";pilltext.innerText="打印机就绪，服务异常";}
+    else if(!d.printer_id){pill.className="svcstate bad";svcdot.className="svcdot bad";pilltext.innerText="未配置打印机";}
     else {pill.className="svcstate bad";svcdot.className="svcdot bad";pilltext.innerText="打印机未连接";}
   }).catch(function(){});
 
@@ -2822,6 +2870,11 @@ body{background:var(--bg);font-family:-apple-system,"Segoe UI","Microsoft YaHei"
 .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px 20px;box-shadow:0 8px 24px rgba(20,40,70,.06)}
 h2{font-size:17px;font-weight:600;margin-bottom:6px}
 .desc{font-size:12.5px;color:var(--sub);line-height:1.7;margin-bottom:16px}
+.sethint{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border:1px solid #ffd995;background:#fffaf0;
+ border-radius:12px;margin-bottom:14px;font-size:13px;color:#8a5a0a;line-height:1.6}
+.sethint b{color:#7a4d00;font-weight:600}
+.sethint a{color:#1f6feb;text-decoration:none}
+.sethint a:hover{text-decoration:underline}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 input,select{width:100%;padding:12px 13px;border:1px solid var(--line);border-radius:10px;font-size:14px;outline:none;background:#fbfcfd;color:var(--txt)}
 input:focus,select:focus{border-color:var(--brand);background:#fff}
@@ -2908,7 +2961,15 @@ def settings_index_body():
                 '<span class="setinfo"><b>访问地址</b>'
                 '<span>面板 http://%s:%d ｜ 打印端口 %s:%d</span></span></div>') % (
                     ICONS.get("printer", ""), ip, WEB_PORT, ip, PRINT_PORT)
-    return '<div class="desc">面板的所有配置都在这里，点进去按需修改。</div><div class="setlist">%s</div>%s' % (rows, addr)
+    hint = ""
+    if not PRINTER_ID:
+        hint = ('<div class="sethint"><span class="setic">%s</span>'
+                '<span><b>打印机未配置</b><br>'
+                '还没设置打印机 ID，当前不会连接任何设备，收到打印任务会直接失败。'
+                '去<a href="/device">设备设置</a>页点“扫描 USB 设备”选中后保存即可。</span></div>') % (
+                    ICONS.get("printer", ""))
+    return ('<div class="desc">面板的所有配置都在这里，点进去按需修改。</div>%s'
+            '<div class="setlist">%s</div>%s') % (hint, rows, addr)
 
 
 def settings_page(title, active, body, script=""):
@@ -2954,9 +3015,9 @@ def settings_page(title, active, body, script=""):
 
 
 DEVICE_BODY = """
-<div class="desc">当前生效设备：<b>%CUR%</b>。改完保存会立即按新设备重新连接，无需重启容器。</div>
+<div class="desc">当前生效设备：<b>%CURTEXT%</b>。改完保存会立即按新设备重新连接，无需重启容器。</div>
 <div class="row">
-  <input class="inline" id="d_id" placeholder="0482:0d44" value="%CUR%">
+  <input class="inline" id="d_id" placeholder="扫描自动填入" value="%CUR%">
   <button class="btn" onclick="scan()">扫描 USB 设备</button>
   <button class="btn ghost" onclick="save()">保存设备 ID</button>
 </div>
@@ -2965,7 +3026,7 @@ DEVICE_BODY = """
   <div class="list" id="list"><div class="empty">尚未扫描</div></div>
 </div>
 <div class="msg" id="msg"></div>
-<div class="note">支持写法：0482:0d44、0482-0d44、0x0482:0x0d44、04820d44。扫描只能看到已通电且被容器识别到的设备；插在 USB HUB 上也能扫到，但个别 HUB 供电不足会导致打印中断，建议直插 NAS。</div>
+<div class="note">支持写法：1234:5678、1234-5678、0x1234:0x5678、12345678（这里只是格式示例，实际填扫描出来的那台）。扫描只能看到已通电且被容器识别到的设备；插在 USB HUB 上也能扫到，但个别 HUB 供电不足会导致打印中断，建议直插 NAS。</div>
 """
 
 DEVICE_SCRIPT = """
@@ -3554,7 +3615,8 @@ def index():
 
 @app.route("/device")
 def page_device():
-    body = DEVICE_BODY.replace("%CUR%", PRINTER_ID)
+    body = (DEVICE_BODY.replace("%CURTEXT%", device_label())
+                      .replace("%CUR%", PRINTER_ID or ""))
     return Response(settings_page("设备设置", "设备设置", body, DEVICE_SCRIPT), mimetype="text/html")
 
 
@@ -4060,20 +4122,22 @@ def api_save_config():
     dev_body = body.get("device")
     if isinstance(dev_body, dict) and "id" in dev_body:
         new_id = str(dev_body.get("id", "")).strip()
-        parsed = parse_device_id(new_id)
-        if not parsed:
-            return jsonify({"ok": False, "msg": "设备 ID 格式不正确，应形如 0482:0d44"})
         old_id = PRINTER_ID
+        if new_id and not parse_device_id(new_id):
+            return jsonify({"ok": False, "msg": "设备 ID 格式不正确，应形如 1234:5678（4 位十六进制:4 位十六进制）"})
         apply_device_id(new_id)
         with cfg_lock:
             CFG.setdefault("device", {})["id"] = PRINTER_ID
         save_config()
-        msg_list.append("设备 ID 已改为 %s" % PRINTER_ID)
+        if PRINTER_ID:
+            msg_list.append("设备 ID 已改为 %s" % PRINTER_ID)
+        else:
+            msg_list.append("设备配置已清空，扫描选中一台设备后再保存即可")
         if PRINTER_ID != old_id:
-            log("设备 ID 已更新：%s → %s，重新连接设备" % (old_id, PRINTER_ID))
+            log("设备 ID 已更新：%s → %s" % (old_id or "未配置", PRINTER_ID or "未配置（暂停连接）"))
             threading.Thread(target=printer.reconnect, daemon=True).start()
         else:
-            log("设备 ID 未变化：%s" % PRINTER_ID)
+            log("设备 ID 未变化：%s" % device_label())
 
     keep_body = body.get("jobs_keep")
     if keep_body is not None:
@@ -4188,7 +4252,7 @@ def api_push_test():
         "推送测试",
         push_html([
             "<b>USB 打印服务：推送测试</b>",
-            "设备：%s（%s）" % (st.get("printer_name") or "USB 打印机", PRINTER_ID),
+            "设备：%s（%s）" % (st.get("printer_name") or "USB 打印机", device_label()),
             "打印机状态：%s" % ("在线" if st.get("usb_online") else "离线"),
             "渠道：%s" % push_conf().get("channel", ""),
             "时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -4206,7 +4270,7 @@ if __name__ == "__main__":
     if _hist:
         log("（进程重启过，已从 data/panel.log 载入上次运行的 %d 行日志）" % _hist)
     log("配置文件：%s" % CONFIG_PATH)
-    log("目标设备 ID：%s（可在网页「设备设置」里修改）" % PRINTER_ID)
+    log("目标设备 ID：%s" % (PRINTER_ID or "未配置（打开网页「设备设置」页扫描 USB 设备并保存即可）"))
     # host 网络模式下 docker ps 看不到端口映射，这里直接把可用地址打印出来
     _ip = primary_lan_ip()
     if _ip:
