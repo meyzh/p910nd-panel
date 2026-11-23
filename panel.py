@@ -127,10 +127,22 @@ push_info = {"count": 0, "last_time": "", "last_result": ""}
 # ==================== 日志 ====================
 
 _log_writes = [0]
+_log_fh = [None]
+
+
+def _close_log_fh():
+    fh = _log_fh[0]
+    _log_fh[0] = None
+    if fh is not None:
+        try:
+            fh.close()
+        except Exception:
+            pass
 
 
 def _trim_log_file():
     """日志文件过大时压回最近 LOG_KEEP_LINES 行，避免无限增长。"""
+    _close_log_fh()
     try:
         if os.path.getsize(LOG_PATH) <= LOG_FILE_LIMIT:
             return
@@ -147,16 +159,21 @@ def log(msg):
     with lock:
         logs.append(line)
         # 同时写进 data/panel.log：进程被自动/手动重启后还能看到重启前的记录
+        # 句柄长期持有：高频日志（打印反复失败时）逐行 open/close 会明显拖慢整台机器
         try:
             if not os.path.isdir(DATA_DIR):
                 os.makedirs(DATA_DIR)
-            with open(LOG_PATH, "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
+            fh = _log_fh[0]
+            if fh is None or getattr(fh, "closed", False):
+                fh = open(LOG_PATH, "a", encoding="utf-8")
+                _log_fh[0] = fh
+            fh.write(line + "\n")
+            fh.flush()
             _log_writes[0] += 1
             if _log_writes[0] % 200 == 0:
                 _trim_log_file()
         except Exception:
-            pass
+            _log_fh[0] = None
     print(line, flush=True)
 
 
@@ -1902,6 +1919,30 @@ def print_server_loop():
 offline_since = None
 offline_alerted = False
 connect_fail_streak = 0
+usb_rescan_last = 0.0
+
+
+def usb_rescan(force=False, reason=""):
+    """让内核重新扫描 PCI/USB 总线。
+
+    打印机休眠、USB 端口被挂起或控制器异常后，/sys/bus/usb/devices 里会彻底
+    没有这台设备，此时重连 libusb 是找不回来的（只有容器重启才“碰巧”恢复）。
+    写 /sys/bus/pci/rescan 让内核重新枚举，是最通用的触发方式。
+    默认 5 分钟最多一次，避免反复挑动总线。
+    """
+    global usb_rescan_last
+    now = time.time()
+    if not force and now - usb_rescan_last < 300:
+        return False
+    usb_rescan_last = now
+    try:
+        with open("/sys/bus/pci/rescan", "w") as fh:
+            fh.write("1")
+    except Exception as exc:
+        log("USB 总线重扫失败（/sys 不可写或内核不支持）：%s" % exc)
+        return False
+    log("已请求内核重新扫描 PCI/USB 总线%s" % ("（%s）" % reason if reason else ""))
+    return True
 
 
 def restart_self(force=False):
@@ -2001,6 +2042,9 @@ def watcher_loop():
                         log("打印机已断开：未检测到 %s，等待重新插入" % device_label())
                 if offline_since is None:
                     offline_since = time.time()
+                # 设备彻底从总线消失时，单纯重连没用：定期让内核重新枚举一次
+                if present is False and (time.time() - offline_since) >= 90:
+                    usb_rescan(reason="打印机离线超过 90 秒")
                 if (not offline_alerted) and push_ready() and (time.time() - offline_since) >= alert_sec:
                     offline_alerted = True
                     push_async(
@@ -2368,6 +2412,7 @@ td.bad{color:var(--bad);font-weight:600}
 input,select{padding:11px 12px;border:1px solid var(--line);border-radius:10px;font-size:14px;outline:none;background:#fbfcfd;color:var(--txt)}
 input:focus,select:focus{border-color:var(--brand);background:#fff}
 .logbox{background:#0f1720;color:#7ee0a4;border-radius:12px;padding:14px;height:280px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:13px;line-height:1.65;white-space:pre-wrap}
+.logbox .logline{white-space:pre-wrap;word-break:break-all}
 .foot{text-align:center;font-size:12px;color:var(--sub);margin:16px 0 4px}
 @media (max-width:700px){.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.stat.wide{grid-column:span 3}.stat.tri{grid-column:span 1}}
 @media (max-width:560px){.title{font-size:17px}.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.stat.wide,.stat.tri{grid-column:auto}.stat.wide{grid-column:span 3}.stat{padding:12px}.stat .k{font-size:11.5px}.stat .v{font-size:16px;margin-top:5px}button{flex:1 1 45%}.iconbtn{width:34px;height:34px;font-size:15px}
@@ -2696,7 +2741,8 @@ function initJobSize(){
 function renderJobs(){
   var body = document.getElementById("jobbody");
   if(!body) return;
-  var total = jobCache.length;
+  var total = jobCache.length;          // 本地只留最近 300 条，翻页也按这份算
+  var trueTotal = jobTotal || total;    // 页面信息里显示服务端的真实总数
   var pages = Math.max(1, Math.ceil(total / jobPageSize));
   if(jobPageNo > pages - 1) jobPageNo = pages - 1;
   if(jobPageNo < 0) jobPageNo = 0;
@@ -2711,7 +2757,8 @@ function renderJobs(){
     body.innerHTML = html;
   }
   var info = document.getElementById("jobpageinfo");
-  if(info) info.innerText = "第 " + (jobPageNo + 1) + " / " + pages + " 页 · 共 " + total + " 条";
+  if(info) info.innerText = "第 " + (jobPageNo + 1) + " / " + pages + " 页 · 共 " + trueTotal + " 条"
+    + (trueTotal > total ? "（本页只留最近 " + total + " 条）" : "");
   var prev = document.getElementById("jobprev"), next = document.getElementById("jobnext");
   if(prev) prev.disabled = jobPageNo <= 0;
   if(next) next.disabled = jobPageNo >= pages - 1;
@@ -2758,41 +2805,73 @@ function refresh(){
     else {pill.className="svcstate bad";svcdot.className="svcdot bad";pilltext.innerText="打印机未连接";}
   }).catch(function(){});
 
-  fetch("/api/jobs").then(function(r){return r.json();}).then(function(d){
-    jobCache = (d.jobs || []).slice().reverse();
-    renderJobs();
-  }).catch(function(){});
-
   loadLog();
   loadStats();
+  loadJobs();
 }
 
-var logFrom = 0, logLoaded = false;
+// 打印记录单独轮询（8 秒一次，且内容没变就不重绘）：任务多时每 3 秒拉全量很吃带宽和 CPU
+var jobSig = "", jobTotal = 0;
+function loadJobs(){
+  if(document.hidden) return;
+  fetch("/api/jobs?limit=300").then(function(r){return r.json();}).then(function(d){
+    var arr = (d.jobs || []).slice().reverse();
+    var head = arr[0] || {};
+    var sig = (d.total || 0) + "|" + (head.time || "") + "|" + (head.ok === null ? "run" : head.ok) + "|" + (head.size || 0);
+    if(sig === jobSig) return;
+    jobSig = sig;
+    jobTotal = d.total || arr.length;
+    jobCache = arr;
+    renderJobs();
+  }).catch(function(){});
+}
+
+var logFrom = 0, logLoaded = false, logLines = 0;
+var LOG_MAX_LINES = 400;   // 每行一个节点，只保留最近 400 行：日志越多也越卡的老问题就没了
+
+// 增量追加：不再每次把整块文本重写一遍（1593 行时那样写一次就要几百毫秒）
+function logAppend(lines){
+  var box = document.getElementById("logbox");
+  if(!box || !lines.length) return;
+  var stick = box.scrollTop + box.clientHeight + 40 >= box.scrollHeight;
+  if(!logLines) box.innerHTML = "";
+  var frag = document.createDocumentFragment();
+  for(var i=0;i<lines.length;i++){
+    var d = document.createElement("div");
+    d.className = "logline";
+    d.textContent = lines[i];
+    frag.appendChild(d);
+  }
+  box.appendChild(frag);
+  logLines += lines.length;
+  while(logLines > LOG_MAX_LINES && box.firstElementChild){
+    box.removeChild(box.firstElementChild);
+    logLines--;
+  }
+  if(stick) box.scrollTop = box.scrollHeight;
+}
 
 function loadLog(){
   if(document.hidden) return;   // 页面在后台时不拉日志，回到前台会立刻补一次
-  var box = document.getElementById("logbox");
   fetch("/api/log?since=" + logFrom, {cache:"no-store"}).then(function(r){
     var total = parseInt(r.headers.get("X-Log-Total") || "0", 10);
     if(isNaN(total)) total = 0;
     return r.text().then(function(txt){ return {txt: txt, total: total}; });
   }).then(function(res){
+    var box = document.getElementById("logbox");
     if(!box) return;
     if(res.total < logFrom){          // 服务重启过，日志重新从第 0 行开始
-      logFrom = 0; logLoaded = false; box.innerText = "";
+      logFrom = 0; logLoaded = false; logLines = 0; box.innerHTML = "";
       return loadLog();
     }
     var txt = (res.txt || "").replace(/\\n+$/, "");
     var newLines = txt ? txt.split("\\n") : [];
     if(!logLoaded){
-      box.innerText = newLines.length ? newLines.join("\\n") : "暂无日志";
       logLoaded = true;
-      box.scrollTop = box.scrollHeight;
-    } else if(newLines.length){
-      var stick = box.scrollTop + box.clientHeight + 40 >= box.scrollHeight;
-      var base = box.innerText === "暂无日志" ? "" : box.innerText;
-      box.innerText = base ? base + "\\n" + newLines.join("\\n") : newLines.join("\\n");
-      if(stick) box.scrollTop = box.scrollHeight;
+      if(newLines.length) logAppend(newLines.slice(-LOG_MAX_LINES));
+      else{ box.innerText = "暂无日志"; logLines = 0; }
+    }else if(newLines.length){
+      logAppend(newLines);
     }
     logFrom = res.total;
     setText("loghint", "共 " + res.total + " 行 · 已存档到 data/panel.log");
@@ -2819,8 +2898,8 @@ function toggleAuto(){
 function startTimer(){stopTimer();timer=setInterval(refresh,3000);}
 function stopTimer(){if(timer){clearInterval(timer);timer=null;}}
 
-// 日志单独按 2 秒轮询，跟“自动刷新”开关无关，日志永远实时
-setInterval(loadLog, 2000);
+// 日志单独按 3 秒轮询，跟“自动刷新”开关无关，日志永远实时
+setInterval(loadLog, 3000);
 document.addEventListener("visibilitychange", function(){ if(!document.hidden) loadLog(); });
 // 页面从后台回到前台时补一次状态
 document.addEventListener("visibilitychange", function(){ if(!document.hidden && autoRefresh) refresh(); });
@@ -2844,6 +2923,8 @@ function initStatDays(){
 initStatDays();
 initJobSize();
 refresh();
+loadJobs();
+setInterval(loadJobs, 8000);
 loadNotes();
 setInterval(loadNotes, 30000);
 startTimer();
@@ -3930,9 +4011,17 @@ def api_log():
 
 @app.route("/api/jobs")
 def api_jobs():
+    """默认只返回最近 200 条：任务多时全量下发会让面板每几秒传上百 KB。"""
+    try:
+        limit = int(request.args.get("limit") or 200)
+    except Exception:
+        limit = 200
+    limit = max(1, min(limit, JOB_KEEP_MAX))
     with jobs_lock:
-        data = [dict(item) for item in jobs]
-    return jsonify({"jobs": data})
+        total = len(jobs)
+        src = list(jobs)[-limit:] if limit < total else list(jobs)
+        data = [dict(item) for item in src]
+    return jsonify({"jobs": data, "total": total})
 
 
 @app.route("/api/jobs/clear", methods=["POST"])
@@ -4232,6 +4321,13 @@ def api_reconnect():
         # 连不上时把现场信息打出来，便于判断是设备节点、权限还是控制传输的问题
         for line in printer.diag():
             log("USB 诊断：" + line)
+        if printer.sysfs_present() is False:
+            # 设备已经不在总线上，重连 libusb 没有意义：让内核重新枚举后再试一次
+            if usb_rescan(force=True, reason="手动重连时设备不在总线"):
+                time.sleep(3)
+                ok = printer.connect()
+                if ok:
+                    log("USB 总线重扫后已重新识别到打印机")
     return jsonify({"ok": ok})
 
 
