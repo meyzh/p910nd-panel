@@ -60,7 +60,9 @@ def _env_port(name, default):
 
 PRINT_PORT = _env_port("PRINT_PORT", 9100)
 WEB_PORT = _env_port("WEB_PORT", 8910)
-USB_TIMEOUT_MS = 5000
+USB_TIMEOUT_MS = 8000        # 单次 bulk 写超时：打印机忙/在睡眠时会 NAK，太短容易误判失败
+WRITE_RETRY_MAX = 5          # 同一块数据最多重试几次（1/2/4/8 秒退避，中途还会重连唤醒）
+WRITE_RECONNECT_AT = 2       # 第几次超时后尝试重连唤醒打印机（USB 重新枚举常能把睡眠中的机器叫醒）
 CHUNK_SIZE = 4096
 JOB_KEEP_MIN = 100
 JOB_KEEP_MAX = 5000
@@ -271,6 +273,9 @@ def build_default_config():
         "notes": {},      # 来源备注：设备主机名或 IP -> 自定义名字
         "src_hidden": [],  # 来源管理里删除掉的来源 IP，不再出现在列表
         "jobs_keep": 0,   # 打印监控保留条数，0 = 跟随环境变量 JOB_KEEP
+        # 端口的网页端覆盖值，0 = 跟随环境变量 / 默认（9100、8910）；改完要重启容器才生效
+        "print_port": 0,
+        "web_port": 0,
     }
 
 
@@ -327,6 +332,13 @@ def load_config():
         cfg["jobs_keep"] = int(cfg.get("jobs_keep") or 0)
     except Exception:
         cfg["jobs_keep"] = 0
+    for key in ("print_port", "web_port"):
+        try:
+            cfg[key] = int(cfg.get(key) or 0)
+        except Exception:
+            cfg[key] = 0
+        if not (1 <= cfg[key] <= 65535):
+            cfg[key] = 0        # 脏值当未设置，回落到环境变量 / 默认端口
     return cfg
 
 
@@ -346,6 +358,30 @@ def save_config(cfg=None):
 
 
 CFG = load_config()
+
+
+def apply_cfg_ports():
+    """把网页里保存的端口覆盖到全局：0 表示不覆盖，沿用环境变量 / 默认值。
+
+    监听端口只能在启动时确定，所以这里只在进程启动阶段调用一次，
+    网页改完端口后需要重启容器才生效。
+    """
+    global PRINT_PORT, WEB_PORT
+    for key, attr, cur in (("print_port", "PRINT_PORT", PRINT_PORT),
+                           ("web_port", "WEB_PORT", WEB_PORT)):
+        try:
+            val = int(CFG.get(key) or 0)
+        except Exception:
+            val = 0
+        if 1 <= val <= 65535 and val != cur:
+            if attr == "PRINT_PORT":
+                PRINT_PORT = val
+            else:
+                WEB_PORT = val
+            print("[INFO] %s 使用网页保存的 %d（配置文件）" % (attr, val), flush=True)
+
+
+apply_cfg_ports()
 
 
 def cfg_job_keep():
@@ -1290,11 +1326,12 @@ class UsbPrinter(object):
         txt = str(exc).lower()
         return ("timed out" in txt) or ("timeout" in txt) or ("errno 110" in txt)
 
-    def _fail_write(self, exc):
+    def _fail_write(self, exc, tried=0):
         """写入彻底失败时释放句柄并落回离线，交给守护线程重新连一遍。
 
-        超时（Errno 110）几乎都是打印机侧没取数据（休眠 / 缺纸 / 卡纸 / 盖板未关 /
-        拔插后没恢复），继续拿着同一个句柄重试只会反复超时。
+        超时（Errno 110）几乎都是打印机侧没取数据（睡眠 / 缓冲忙 / 缺纸 / 卡纸 /
+        盖板未关 / 拔插后没恢复）。已经按 WRITE_RETRY_MAX 次重试并重连唤醒过，
+        再拿着同一个句柄试只会反复超时。
         """
         timeout = self._is_timeout(exc)
         try:
@@ -1302,16 +1339,18 @@ class UsbPrinter(object):
         except Exception:
             pass
         if timeout:
+            waited = tried * (USB_TIMEOUT_MS / 1000.0) if tried else 0
             set_state(
                 usb_online=False,
                 printer_name="",
                 usb_bus="",
                 usb_addr="",
                 usb_speed="",
-                last_error="写入超时（Errno 110）：打印机休眠 / 缺纸 / 卡纸 / 盖板未关",
+                last_error="写入超时（Errno 110）：打印机长时间没有取数据（睡眠 / 缓冲忙 / 缺纸 / 卡纸）",
             )
-            log("USB 写入超时（Errno 110）：15 秒内一个字节都没送出去，"
-                "常见原因是打印机休眠、缺纸、卡纸、盖板未关，或拔插后设备没恢复；已释放句柄，等待自动重连")
+            log("USB 写入超时（Errno 110）：重试 %d 次、累计约 %.0f 秒打印机始终没有取数据"
+                "（睡眠 / 缓冲还在处理上一单 / 缺纸 / 卡纸 / 盖板未关）；已释放句柄，等待自动重连"
+                % (tried or WRITE_RETRY_MAX, waited or (WRITE_RETRY_MAX * USB_TIMEOUT_MS / 1000.0)))
         else:
             set_state(
                 usb_online=False,
@@ -1323,6 +1362,28 @@ class UsbPrinter(object):
             )
             log("USB 写入失败：%s；已释放句柄，等待自动重连" % exc)
 
+    def _wake_reconnect(self):
+        """write() 持锁期间用：重新枚举设备并重开句柄，把睡眠/挂起的打印机叫醒。
+
+        调用方必须已经持有 io_lock（connect() 会自己取锁，在这里调会死锁）。
+        """
+        try:
+            self._close()
+        except Exception:
+            pass
+        try:
+            cur = self._find_dev()
+        except Exception as exc:
+            log("唤醒重连失败：查找设备出错（%s）" % exc)
+            return False
+        if cur is None:
+            return False
+        try:
+            return self._open_once(cur, silent=True)
+        except Exception as exc:
+            log("唤醒重连失败：%s" % exc)
+            return False
+
     def write(self, data):
         with self.io_lock:
             if self.ep_out is None:
@@ -1333,6 +1394,10 @@ class UsbPrinter(object):
                 buf = data[offset:offset + CHUNK_SIZE]
                 retry = 0
                 while True:
+                    if self.ep_out is None:
+                        # 重连把句柄清掉了又没连回来：别再拿 None 去写，直接交给守护线程
+                        self._fail_write(RuntimeError("打印机未连接（写入过程中句柄失效）"), tried=retry)
+                        raise RuntimeError("写入 USB 失败：打印机未连接")
                     try:
                         if isinstance(self.ep_out, int):
                             # sysfs 端点模式：用设备句柄按端点地址直接 bulk 写，不经过描述符
@@ -1342,12 +1407,24 @@ class UsbPrinter(object):
                         break
                     except Exception as exc:
                         retry += 1
-                        if retry >= 3:
-                            self._fail_write(exc)
+                        if retry > WRITE_RETRY_MAX:
+                            self._fail_write(exc, tried=retry)
                             raise RuntimeError("写入 USB 失败：%s" % exc)
-                        if self._is_timeout(exc) and retry == 1:
-                            log("USB 写入超时（第 1 次）：等待打印机取数据后重试")
-                            time.sleep(1.0)
+                        if self._is_timeout(exc):
+                            # 打印机侧不收数据（缓冲满 / 睡眠 / 缓冲还在处理上一单）：
+                            # 先按 1、2、4、8 秒退避，中途重连一次，USB 重新枚举通常能把它叫醒
+                            if retry >= WRITE_RECONNECT_AT and retry % WRITE_RECONNECT_AT == 0:
+                                if self._wake_reconnect():
+                                    log("USB 已重连（第 %d 次重试），继续写入第 %s / %s 字节"
+                                        % (retry, fmt_bytes(offset), fmt_bytes(total)))
+                                else:
+                                    # 重连也失败说明设备已从总线消失，本单只能作废
+                                    self._fail_write(exc, tried=retry)
+                                    raise RuntimeError("写入 USB 失败：重试并重连后打印机仍不取数据（%s）" % exc)
+                            wait = min(8, 2 ** (retry - 1))
+                            log("USB 写入超时（第 %d/%d 次，Errno 110）：打印机可能忙着处理上一单或在睡眠，%d 秒后重试"
+                                % (retry, WRITE_RETRY_MAX, wait))
+                            time.sleep(wait)
                             continue
                         time.sleep(0.2)
                 offset += written if written else len(buf)
@@ -1528,6 +1605,8 @@ def load_jobs():
                 jobs.clear()
                 for item in data[-JOB_KEEP:]:
                     if isinstance(item, dict):
+                        if not item.get("id"):
+                            item["id"] = os.urandom(6).hex()   # 兼容老版本记录
                         jobs.append(item)
     except Exception as exc:
         print("[WARN] 任务记录读取失败：%s" % exc, flush=True)
@@ -1795,6 +1874,7 @@ def handle_job(conn, addr):
     peer = "%s:%s" % (ip, addr[1])
     started = time.time()
     record = {
+        "id": os.urandom(6).hex(),     # 单条删除用；老数据没有 id，load_jobs 时会补
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "ip": ip,
         "host": host_cache.get(ip, ""),
@@ -1897,7 +1977,7 @@ def print_server_loop():
         srv.bind(("0.0.0.0", PRINT_PORT))
     except OSError as exc:
         log("打印端口 %d 绑定失败：%s" % (PRINT_PORT, exc))
-        log("端口被占用了：容器环境变量里把 PRINT_PORT 改成别的空闲端口（当前 %d），"
+        log("端口被占用了：到网页「端口设置」页改一个空闲端口（当前 %d），"
             "客户端添加打印机时填新端口" % PRINT_PORT)
         set_state(port_listening=False)
         return
@@ -2163,6 +2243,9 @@ AUTH_FOOTER_CSS = (
 # 不用 emoji / 符号字符：部分手机系统缺对应字形，会显示成空白方框（豆腐块）
 
 ICONS = {
+    "plug": '<svg viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="7" rx="2"/>'
+            '<rect x="2" y="13" width="20" height="7" rx="2"/><path d="M6 7.5h.01"/>'
+            '<path d="M6 16.5h.01"/><path d="M10 7.5h.01"/><path d="M10 16.5h.01"/></svg>',
     "gear": '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/>'
             '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06'
             'a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09'
@@ -2390,10 +2473,17 @@ h3 .hint{font-size:12px;color:var(--sub);font-weight:400}
 .col.on .dt{color:var(--brand);font-weight:600}
 .daydetail{margin-top:12px;border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:#fbfcfd;font-size:13px}
 .ddhead{position:relative;padding-right:58px;margin-bottom:10px;line-height:1.75}
+.ddhead.hasclr{padding-right:124px}
 .ddhead b{font-size:13.5px}
 .ddsum{font-size:12.5px;color:var(--sub);margin-left:8px}
 .ddsum em{font-style:normal;color:var(--brand);font-weight:600}
 .ddclose{position:absolute;top:-2px;right:0;border:none;background:none;color:var(--sub);font-size:12px;cursor:pointer;padding:2px 6px;line-height:1.4}
+.ddclr{position:absolute;top:-4px;right:44px;border:1px solid var(--line);background:#fff;color:var(--sub);font-size:12px;cursor:pointer;padding:4px 8px;border-radius:8px;line-height:1.35;white-space:nowrap}
+.ddclr:hover{border-color:#f3c1c2;background:#fff5f5;color:#e5484d}
+.ddclr:active{transform:scale(.97)}
+.ddrow .ddfail{flex:none;width:22px;height:22px;padding:0;margin-left:2px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--sub);cursor:pointer}
+.ddrow .ddfail:hover{border-color:#f3c1c2;background:#fff5f5;color:#e5484d}
+.ddrow .ddfail svg{width:12px;height:12px}
 .ddlist{display:flex;flex-direction:column;gap:6px}
 .ddrow{display:flex;align-items:center;gap:10px;padding:7px 10px;background:#fff;border:1px solid var(--line);border-radius:9px;font-size:12.5px}
 .ddrow .ip{font-weight:600;color:var(--txt)}
@@ -2647,10 +2737,12 @@ function showDay(date){
       return '<div class="ddrow"><span class="ip">' + esc(s.ip) + '</span>'
            + '<span class="hn">' + esc(noteOf(s.ip, s.host)) + '</span>'
            + '<span class="cnt">' + s.n + ' 次</span>'
-           + (s.fail ? '<span class="fl">失败 ' + s.fail + '</span>' : '')
+           + (s.fail ? '<span class="fl">失败 ' + s.fail + '</span>'
+               + '<button class="ddfail" data-date="' + esc(d.date) + '" data-ip="' + esc(s.ip) + '" title="删除该来源这一天的失败记录" aria-label="删除该来源这一天的失败记录">' + DEL_ICON + '</button>' : '')
            + '<span class="bt">' + fmtBytes(s.bytes) + '</span></div>';
     }).join("");
-    box.innerHTML = '<div class="ddhead"><b>' + esc(d.date) + ' 打印明细</b>'
+    box.innerHTML = '<div class="ddhead' + (d.fail ? " hasclr" : "") + '"><b>' + esc(d.date) + ' 打印明细</b>'
+      + (d.fail ? '<button class="ddclr" data-date="' + esc(d.date) + '" data-ip="">清除失败</button>' : '')
       + '<span class="ddsum">总计 <em>' + d.total + '</em> 次 · 成功 ' + (d.succ || 0) + ' · '
       + (d.fail ? '<span class="fl">失败 ' + d.fail + '</span>' : '失败 0') + ' · 数据 ' + fmtBytes(d.bytes) + '</span>'
       + '<button class="ddclose" onclick="closeDay()">收起</button></div>'
@@ -2658,6 +2750,33 @@ function showDay(date){
       + (d.fallback && d.total ? '<div class="ddempty" style="margin-top:8px">来源分布由最近 %JOB_KEEP% 条任务记录推算（分来源统计从本版本开始累计）</div>' : "");
   }).catch(function(){ box.innerHTML = '<div class="ddempty">读取失败</div>'; });
 }
+
+function delDayFail(date, ip){
+  var tip = ip ? ("清除 " + ip + " 在 " + date + " 的全部失败记录？") : ("清除 " + date + " 的全部失败记录？");
+  tip += "\\n图表里的失败数会一起扣减，成功记录和进行中的任务不受影响，删除后无法恢复。";
+  if(!confirm(tip)) return;
+  fetch("/api/jobs/delete_fail", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({date: date, ip: ip || ""})}).then(function(r){ return r.json(); }).then(function(d){
+    if(!d.ok){ alert(d.msg || "清除失败"); return; }
+    jobSig = "";
+    loadJobs();
+    loadStats(true);
+    showDay(date);
+  }).catch(function(){ alert("清除失败，请稍后重试"); });
+}
+
+(function(){
+  document.addEventListener("click", function(e){
+    var t = e.target;
+    while(t && t.nodeType === 1 && !(t.className && (String(t.className).indexOf("ddclr") === 0 || String(t.className).indexOf("ddfail") === 0))){
+      t = t.parentNode;
+    }
+    if(t && t.nodeType === 1 && t.getAttribute && t.getAttribute("data-date")){
+      e.stopPropagation();
+      delDayFail(t.getAttribute("data-date"), t.getAttribute("data-ip") || "");
+    }
+  });
+})();
 
 function closeDay(){
   daySel = "";
@@ -2812,6 +2931,8 @@ function refresh(){
 
 // 打印记录单独轮询（8 秒一次，且内容没变就不重绘）：任务多时每 3 秒拉全量很吃带宽和 CPU
 var jobSig = "", jobTotal = 0;
+var DEL_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12"/><path d="M10 11v5"/><path d="M14 11v5"/></svg>';   // 当日明细里「清除失败」用的图标
+
 function loadJobs(){
   if(document.hidden) return;
   fetch("/api/jobs?limit=300").then(function(r){return r.json();}).then(function(d){
@@ -3014,12 +3135,13 @@ input:focus,select:focus{border-color:var(--brand);background:#fff}
 @media (max-width:560px){.bar{gap:8px}.nav{gap:6px}.nav a{padding:7px 4px;font-size:11.5px}input,select{font-size:16px}}
 """
 
-SETTINGS_PATH_ROWS = [("设备设置", "/device"), ("来源管理", "/notes"), ("数据管理", "/data"), ("推送配置", "/push"), ("修改密码", "/password")]
+SETTINGS_PATH_ROWS = [("设备设置", "/device"), ("端口设置", "/ports"), ("来源管理", "/notes"), ("数据管理", "/data"), ("推送配置", "/push"), ("修改密码", "/password")]
 
-SETTINGS_INDEX_ICON = {"设备设置": "printer", "来源管理": "tag", "数据管理": "chart", "推送配置": "bell", "修改密码": "key"}
+SETTINGS_INDEX_ICON = {"设备设置": "printer", "端口设置": "plug", "来源管理": "tag", "数据管理": "chart", "推送配置": "bell", "修改密码": "key"}
 
 SETTINGS_INDEX_DESC = {
     "设备设置": "选择要共享的 USB 打印机设备，保存后立即重连。",
+    "端口设置": "改 RAW 打印端口与面板端口，保存后自动重启生效，客户端填新端口即可。",
     "来源管理": "查看每个来源的备注、最近一次打印时间与累计数据量，不需要的可直接删除。",
     "数据管理": "调整打印监控保留条数，清理累计任务与累计数据。",
     "推送配置": "配置 Pushplus 推送渠道与触发条件，可发一条测试推送。",
@@ -3344,6 +3466,85 @@ function clearAll(){
     setMsg(d.msg||"", d.ok);
     load();
   }).catch(function(){ setMsg("清除失败",false); });
+}
+load();
+"""
+
+PORT_BODY = """
+<div class="desc">这里的端口保存后由服务自己在启动时读取，改完点「保存并重启」即可生效，不用重建容器，数据和配置都保留。留空表示跟随环境变量 / 默认值。</div>
+<div class="sec">
+  <div class="sech">RAW 打印端口 <span class="muted">默认 9100，客户端添加打印机时填这个端口</span></div>
+  <div class="row">
+    <input class="inline" id="p_print" type="number" min="1" max="65535" step="1" style="flex:0 0 190px;min-width:150px" placeholder="留空 = 默认值">
+  </div>
+  <div class="muted" id="p_print_info" style="margin-top:10px"></div>
+</div>
+<div class="sec">
+  <div class="sech">面板端口 <span class="muted">默认 8910，浏览器访问这个端口进面板</span></div>
+  <div class="row">
+    <input class="inline" id="p_web" type="number" min="1" max="65535" step="1" style="flex:0 0 190px;min-width:150px" placeholder="留空 = 默认值">
+  </div>
+  <div class="muted" id="p_web_info" style="margin-top:10px"></div>
+</div>
+<div class="btns">
+  <button class="btn" onclick="savePorts(false)">保存并重启</button>
+  <button class="btn ghost" onclick="savePorts(true)">恢复默认端口</button>
+</div>
+<div class="msg" id="msg"></div>
+<div class="note">两个端口不能相同。改成面板端口后，重启完成请用新地址访问（旧地址会打不开）；打印机客户端也要把端口改成新的 RAW 端口。1~1023 属于特权端口，容器里可能绑定失败，建议用 1024 以上。<br>host 网络模式下容器没有端口映射，改这里就够了；用 bridge 网络模式部署的话，compose 里的 ports 仍需另配。</div>
+"""
+
+PORT_SCRIPT = """
+var PORTS_NOW = {print: 9100, web: 8910};
+function setMsg(t,ok){
+  var e=document.getElementById("msg");
+  e.innerText=t||"";
+  e.className="msg "+(ok?"ok":"bad");
+}
+function load(){
+  fetch("/api/config",{cache:"no-store"}).then(function(r){return r.json();}).then(function(d){
+    var p = d.ports || {};
+    PORTS_NOW.print = p.print_now || PORTS_NOW.print;
+    PORTS_NOW.web = p.web_now || PORTS_NOW.web;
+    document.getElementById("p_print").value = p.print ? p.print : "";
+    document.getElementById("p_web").value = p.web ? p.web : "";
+    document.getElementById("p_print").placeholder = "留空 = " + PORTS_NOW.print;
+    document.getElementById("p_web").placeholder = "留空 = " + PORTS_NOW.web;
+    document.getElementById("p_print_info").innerText =
+      "当前生效：" + PORTS_NOW.print + "（本进程正在监听）" + (p.print ? "；已保存自定义值 " + p.print + "，重启后切过去" : "；未自定义，跟随环境变量 / 默认值");
+    document.getElementById("p_web_info").innerText =
+      "当前生效：" + PORTS_NOW.web + (p.web ? "；已保存自定义值 " + p.web + "，重启后切过去" : "；未自定义，跟随环境变量 / 默认值");
+  }).catch(function(){ setMsg("读取失败",false); });
+}
+function savePorts(reset){
+  var body = {ports:{}};
+  if(reset){
+    body.ports.print = "";
+    body.ports.web = "";
+  }else{
+    var keep = document.getElementById("p_print").value.trim();
+    var web = document.getElementById("p_web").value.trim();
+    if(keep && !/^[0-9]+$/.test(keep)){ setMsg("RAW 打印端口只能是数字", false); return; }
+    if(web && !/^[0-9]+$/.test(web)){ setMsg("面板端口只能是数字", false); return; }
+    body.ports.print = keep;
+    body.ports.web = web;
+    if(keep && web && keep === web){ setMsg("RAW 打印端口和面板端口不能相同", false); return; }
+  }
+  fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})
+    .then(function(r){return r.json();}).then(function(d){
+      if(!d.ok){ setMsg(d.msg||"保存失败", false); return; }
+      setMsg(d.msg || "已保存", true);
+      var target = reset ? PORTS_NOW.web : (parseInt(document.getElementById("p_web").value.trim(),10) || PORTS_NOW.web);
+      fetch("/api/restart",{method:"POST"}).then(function(){
+        setTimeout(function(){
+          if(target && target !== PORTS_NOW.web){
+            location.href = "http://" + location.hostname + ":" + target + "/ports";
+          }else{
+            location.reload();
+          }
+        }, 4500);
+      }).catch(function(){ setTimeout(function(){ location.reload(); }, 4000); });
+    }).catch(function(){ setMsg("保存失败", false); });
 }
 load();
 """
@@ -3716,6 +3917,11 @@ def page_data():
     return Response(settings_page("数据管理", "数据管理", DATA_BODY, DATA_SCRIPT), mimetype="text/html")
 
 
+@app.route("/ports")
+def page_ports():
+    return Response(settings_page("端口设置", "端口设置", PORT_BODY, PORT_SCRIPT), mimetype="text/html")
+
+
 @app.route("/api/totals", methods=["GET"])
 def api_totals():
     with lock:
@@ -4024,6 +4230,106 @@ def api_jobs():
     return jsonify({"jobs": data, "total": total})
 
 
+def _drop_job(jid):
+    """按 id 从队列里摘掉一条记录并存盘，返回快照（找不到返回 None）。"""
+    with jobs_lock:
+        for item in list(jobs):
+            if str(item.get("id") or "") == jid:
+                rec = dict(item)
+                jobs.remove(item)
+                save_jobs()
+                return rec
+    return None
+
+
+def _strip_job_stats(rec):
+    """把一条记录从每日统计、来源分布、累计口径里扣掉，与写入时的口径完全对称。
+
+    0 字节的成功任务（空任务）当初就没进统计，这里也不动。
+    """
+    ok = rec.get("ok")
+    size = int(rec.get("size") or 0)
+    ip = str(rec.get("ip") or "")
+    day = str(rec.get("time") or "")[:10]
+    if ok is True and size == 0:
+        return
+    with stats_lock:
+        d = daily_stats.get(day)
+        if isinstance(d, dict):
+            if ok is True:
+                d["ok"] = max(0, int(d.get("ok", 0)) - 1)
+                d["bytes"] = max(0, int(d.get("bytes", 0)) - size)
+            elif ok is False:
+                d["fail"] = max(0, int(d.get("fail", 0)) - 1)
+            src = d.get("src")
+            srec = src.get(ip) if (isinstance(src, dict) and ip) else None
+            if isinstance(srec, dict):
+                srec["n"] = max(0, int(srec.get("n", 0)) - 1)
+                if ok is True:
+                    srec["ok"] = max(0, int(srec.get("ok", 0)) - 1)
+                    srec["bytes"] = max(0, int(srec.get("bytes", 0)) - size)
+                elif ok is False:
+                    srec["fail"] = max(0, int(srec.get("fail", 0)) - 1)
+                if srec["n"] <= 0 and ip:
+                    src.pop(ip, None)
+    save_stats()
+    if ok is True and size > 0:
+        with lock:
+            state["jobs"] = max(0, int(state["jobs"]) - 1)
+            state["bytes"] = max(0, int(state["bytes"]) - size)
+        save_totals()
+
+
+@app.route("/api/jobs/delete", methods=["POST"])
+def api_jobs_delete():
+    """删除单条打印记录，并把每日统计、累计口径一起扣掉（只删记录不影响其他来源）。"""
+    body = request.get_json(silent=True) or {}
+    jid = str(body.get("id") or "").strip()
+    if not jid:
+        return jsonify({"ok": False, "msg": "缺少记录 ID"})
+    removed = _drop_job(jid)
+    if removed is None:
+        return jsonify({"ok": False, "msg": "这条记录已经不在了（可能刚被清理或已删除）"})
+    _strip_job_stats(removed)
+    ok = removed.get("ok")
+    log("已删除 1 条打印记录：%s，来源 %s，%s，%s" % (
+        removed.get("time", ""), str(removed.get("ip") or "").strip() or "-",
+        fmt_bytes(int(removed.get("size") or 0)),
+        "成功" if ok is True else ("失败" if ok is False else "进行中")))
+    return jsonify({"ok": True, "msg": "已删除该记录，统计已同步"})
+
+
+@app.route("/api/jobs/delete_fail", methods=["POST"])
+def api_jobs_delete_fail():
+    """按日期批量删除失败记录：body 里 ip 为空则清当天所有来源的失败记录。
+
+    只删 ok is False 的行，成功记录与进行中的任务一律不碰。
+    """
+    body = request.get_json(silent=True) or {}
+    date = str(body.get("date") or "").strip()
+    ip = str(body.get("ip") or "").strip()
+    if not date:
+        return jsonify({"ok": False, "msg": "缺少日期"})
+    with jobs_lock:
+        ids = [str(item.get("id") or "") for item in list(jobs)
+               if item.get("ok") is False
+               and str(item.get("time") or "")[:10] == date
+               and (not ip or str(item.get("ip") or "") == ip)
+               and item.get("id")]
+    removed = 0
+    for jid in ids:
+        rec = _drop_job(jid)
+        if rec is not None:
+            _strip_job_stats(rec)
+            removed += 1
+    if not removed:
+        return jsonify({"ok": False, "msg": "当天没有可删的失败记录"})
+    log("已删除 %s 的失败记录 %d 条%s" % (
+        date, removed, ("（来源 %s）" % ip) if ip else ""))
+    return jsonify({"ok": True, "removed": removed,
+                    "msg": "已清除 %d 条失败记录，统计已同步" % removed})
+
+
 @app.route("/api/jobs/clear", methods=["POST"])
 def api_jobs_clear():
     with jobs_lock:
@@ -4199,6 +4505,13 @@ def api_get_config():
         "auth": {
             "set": bool(auth.get("hash")),
         },
+        # 网页里保存的端口（0 = 跟随环境变量）；now_* 是本进程正在监听的端口
+        "ports": {
+            "print": int(CFG.get("print_port") or 0),
+            "web": int(CFG.get("web_port") or 0),
+            "print_now": PRINT_PORT,
+            "web_now": WEB_PORT,
+        },
     }
     return jsonify(safe)
 
@@ -4282,6 +4595,43 @@ def api_save_config():
         save_config()
         msg_list.append("推送配置已保存")
         log("推送配置已更新（离线提醒 %ds）" % push_conf().get("offline_alert_sec"))
+
+    ports_body = body.get("ports")
+    if isinstance(ports_body, dict):
+        picks = {}
+        for key, label in (("print", "RAW 打印端口"), ("web", "面板端口")):
+            if key not in ports_body:
+                continue
+            raw = str(ports_body.get(key) or "").strip()
+            if not raw:
+                picks[key] = 0        # 留空 = 恢复默认 / 跟随环境变量
+                continue
+            try:
+                val = int(raw)
+            except Exception:
+                return jsonify({"ok": False, "msg": "%s 必须是 1~65535 的数字" % label})
+            if not (1 <= val <= 65535):
+                return jsonify({"ok": False, "msg": "%s 必须在 1~65535 之间" % label})
+            picks[key] = val
+        eff_print = picks.get("print") or (int(CFG.get("print_port") or 0) or PRINT_PORT)
+        eff_web = picks.get("web") or (int(CFG.get("web_port") or 0) or WEB_PORT)
+        if eff_print == eff_web:
+            return jsonify({"ok": False, "msg": "RAW 打印端口和面板端口不能相同（%d）" % eff_print})
+        if any(v and v < 1024 for v in picks.values()):
+            log("警告：把端口设到 1024 以下，容器里可能需要额外权限")
+        with cfg_lock:
+            if "print" in picks:
+                CFG["print_port"] = picks["print"]
+            if "web" in picks:
+                CFG["web_port"] = picks["web"]
+        save_config()
+        tips = []
+        if "print" in picks:
+            tips.append("RAW 端口 %s" % (picks["print"] or "默认 %d" % PRINT_PORT))
+        if "web" in picks:
+            tips.append("面板端口 %s" % (picks["web"] or "默认 %d" % WEB_PORT))
+        msg_list.append("端口配置已保存（%s），重启服务后生效" % "，".join(tips))
+        log("端口配置已更新：%s → 重启服务后生效" % "，".join(tips))
 
     auth_body = body.get("auth")
     if isinstance(auth_body, dict):
@@ -4405,6 +4755,6 @@ if __name__ == "__main__":
         _probe.close()
     except OSError as exc:
         log("面板端口 %d 绑定失败：%s" % (WEB_PORT, exc))
-        log("端口被占用了：容器环境变量里把 WEB_PORT 改成别的空闲端口（当前 %d）后重启" % WEB_PORT)
+        log("端口被占用了：到网页「端口设置」页改一个空闲端口（当前 %d）后重启" % WEB_PORT)
         sys.exit(1)
     app.run(host="0.0.0.0", port=WEB_PORT, threaded=True)

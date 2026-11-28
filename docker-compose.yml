@@ -24,7 +24,9 @@ services:
       - ./panel.py:/app/panel.py:ro
     environment:
       - TZ=Asia/Shanghai
-      # host 模式下端口就是 NAS 的 9100 / 8910；被占用时改这两行
+      # host 模式下端口就是 NAS 的 9100 / 8910；
+      # 被占用时优先到面板「设置中心 → 端口设置」里改（改完自动重启生效），
+      # 这里的环境变量只在网页里没设过端口时生效。
       # - WEB_PORT=8911
       # - PRINT_PORT=9101
       # 注意：这里不再配置账号密码。
